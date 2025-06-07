@@ -217,7 +217,7 @@ interface class FileDownloader {
   /// each task was successfully enqueued
   ///
   /// See [enqueue] for details
-  Future<List<bool>> enqueueAll(List<Task> tasks) =>
+  Future<List<bool>> enqueueAll(Iterable<Task> tasks) =>
       _downloader.enqueueAll(tasks);
 
   /// Download a file and return the final [TaskStatusUpdate]
@@ -456,7 +456,7 @@ interface class FileDownloader {
   Future<List<Task>> allTasks(
           {String group = defaultGroup,
           bool includeTasksWaitingToRetry = true,
-          allGroups = false}) =>
+          bool allGroups = false}) =>
       _downloader.allTasks(group, includeTasksWaitingToRetry, allGroups);
 
   /// Returns true if tasks in this [group] are finished
@@ -491,7 +491,7 @@ interface class FileDownloader {
   ///
   /// Every canceled task wil emit a [TaskStatus.canceled] update to
   /// the registered callback, if requested
-  Future<bool> cancelTasksWithIds(List<String> taskIds) =>
+  Future<bool> cancelTasksWithIds(Iterable<String> taskIds) =>
       _downloader.cancelTasksWithIds(taskIds);
 
   /// Cancel this task
@@ -499,6 +499,18 @@ interface class FileDownloader {
   /// The task will emit a [TaskStatus.canceled] update to
   /// the registered callback, if requested
   Future<bool> cancelTaskWithId(String taskId) => cancelTasksWithIds([taskId]);
+
+  /// Cancel this task
+  ///
+  /// The task will emit a [TaskStatus.canceled] update to
+  /// the registered callback, if requested
+  Future<bool> cancel(Task task) => cancelTasksWithIds([task.taskId]);
+
+  /// Cancels all tasks, or those in [tasks], or all tasks in group [group]
+  ///
+  /// Returns true if all cancellations were successful
+  Future<bool> cancelAll({Iterable<Task>? tasks, String? group}) =>
+      _downloader.cancelAll(tasks: tasks, group: group);
 
   /// Return [Task] for the given [taskId], or null
   /// if not found.
@@ -625,7 +637,8 @@ interface class FileDownloader {
             ].contains(record.status))
         .map((record) => record.task)
         .toSet();
-    final nativeTasks = Set<Task>.from(await FileDownloader().allTasks());
+    final nativeTasks =
+        Set<Task>.from(await FileDownloader().allTasks(allGroups: true));
     missingTasks.addAll(enqueuedOrRunningDatabaseTasks.difference(nativeTasks));
     // find missing tasks waiting to retry
     missingTasks.addAll(databaseTasks
@@ -668,6 +681,13 @@ interface class FileDownloader {
     return false;
   }
 
+  /// Pauses all tasks, or those in [tasks], or all tasks in group [group]
+  ///
+  /// Returns list of tasks that were paused
+  Future<List<DownloadTask>> pauseAll(
+          {Iterable<DownloadTask>? tasks, String? group}) =>
+      _downloader.pauseAll(tasks: tasks, group: group);
+
   /// Resume the task
   ///
   /// If no resume data is available for this task, the call to [resume]
@@ -678,6 +698,34 @@ interface class FileDownloader {
   /// If the task is able to resume, it will, otherwise it will restart the
   /// task from scratch, or fail.
   Future<bool> resume(DownloadTask task) => _downloader.resume(task);
+
+  /// Resume all paused tasks, or those in [tasks], or paused tasks in
+  /// group [group]
+  ///
+  /// Calls to resume will be spaced out over time by [interval], defaults to 50ms
+  Future<List<Task>> resumeAll(
+      {Iterable<DownloadTask>? tasks,
+      String? group,
+      Duration interval = const Duration(milliseconds: 50)}) async {
+    final results = <Task>[];
+    final tasksToResume = switch ((tasks, group)) {
+      (Iterable<DownloadTask> tasks, null) => tasks,
+      (null, String group) => (await _downloader.getPausedTasks())
+          .whereType<DownloadTask>()
+          .where((task) => task.group == group),
+      (null, null) =>
+        (await _downloader.getPausedTasks()).whereType<DownloadTask>(),
+      _ => throw AssertionError(
+          "Either 'tasks' or 'group' must be provided, or neither, but not both.")
+    };
+    for (final task in tasksToResume) {
+      if (await resume(task)) {
+        results.add(task);
+      }
+      await Future.delayed(interval);
+    }
+    return results;
+  }
 
   /// Set WiFi requirement globally, based on [requirement].
   ///

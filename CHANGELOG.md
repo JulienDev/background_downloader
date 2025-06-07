@@ -1,3 +1,30 @@
+## 9.2.2
+* Adds option to set the `Content-Disposition` header for binary uploads
+
+For binary uploads, the `Content-Disposition` header will be:
+- set to 'attachment = "filename"' if the task.headers field does not contain an entry for 'Content-Disposition' (the prior default)
+- not set at all (i.e. omitted) if the task.headers field contains an entry for 'Content-Disposition' with the value '' (an empty string)
+- set to the value of `task.headers['Content-Disposition']` in all other cases
+
+* Fixes bug on iOS when using `openFile` with a filepath containing spaces
+
+## 9.2.1
+* Minor bug fixes
+
+## 9.2.0
+* Adds `updates` broadcast stream to the `database` property, which emits every `TaskRecord` update made to the database.
+* Fixes issue with `start` and `rescheduleKilledTasks` when using group names for tasks
+* Minor bug fixes and enhancements
+
+## 9.1.1
+* Adds optional `group` parameter to `resumeAll`
+* Fixes concurrency bugs in Android
+
+## 9.1.0
+* Adds `pauseAll`, `cancelAll` and `resumeAll`
+* Improves handling `enqueuAll` to not starve the UI thread
+* Fixes compilation bug when compiling with XCode 16.2
+
 ## 9.0.0
 * Introduces URI operations, including file/photo/video/directory pickers, under the `uri` property, and `UriDownloadTask` and `UriUploadTask`. See [Working with URIs](doc/URI.md). 
 * [Breaking] removes references to `asAndroidUri` - use the new methods on the `uri` property instead
@@ -32,6 +59,9 @@ New/modified `Task` types:
 *   `UriDownloadTask`: Downloads a file to a specified directory URI. On Android, this bypasses the temp file used in the traditional approach and downloads directly to the destination.
 *   `UriUploadTask`: Uploads a file from a given file URI. If the `filename` is omitted, it will be based on the task's URL.
 *   `MultiUploadTask`: now accepts Uri where previously only filename or file path was allowed
+
+## 8.9.5
+* Fixes issue with `start` and `rescheduleKilledTasks` when using group names for tasks
 
 ## 8.9.4
 * Modifies the interval between `TaskProgressUpdate` such that an update is sent at least once every 2.5 seconds if progress has been made, even if it less than 2% of the file size

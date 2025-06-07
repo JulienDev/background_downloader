@@ -187,14 +187,14 @@ class Task(
                 updates == Updates.statusAndProgress
     }
 
-    /** True if this task is a DownloadTask or ParallelDownloadTask */
+    /** True if this task is a DownloadTask, UriDownloadTask or ParallelDownloadTask */
     fun isDownloadTask(): Boolean {
-        return taskType == "DownloadTask" || taskType == "ParallelDownloadTask"
+        return taskType == "DownloadTask" || taskType == "UriDownloadTask" || taskType == "ParallelDownloadTask"
     }
 
     /** True if this task is an UploadTask or MultiUploadTask */
     fun isUploadTask(): Boolean {
-        return taskType == "UploadTask" || taskType == "MultiUploadTask"
+        return taskType == "UploadTask" || taskType == "UriUploadTask" || taskType == "MultiUploadTask"
     }
 
     /** True if this task is a ParallelDownloadTask */

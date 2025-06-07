@@ -66,7 +66,7 @@ final class DesktopDownloader extends BaseDownloader {
   }
 
   @override
-  Future<List<bool>> enqueueAll(List<Task> tasks) async {
+  Future<List<bool>> enqueueAll(Iterable<Task> tasks) async {
     final results = <bool>[];
     for (final task in tasks) {
       results.add(await enqueue(task));
@@ -376,6 +376,12 @@ final class DesktopDownloader extends BaseDownloader {
   }
 
   @override
+  Future<List<bool>> pauseTaskList(Iterable<Task> tasksToPause) async {
+    final pauseCalls = tasksToPause.map((task) => pause(task));
+    return Future.wait(pauseCalls);
+  }
+
+  @override
   Future<bool> resume(Task task) async {
     if (await super.resume(task)) {
       task = awaitTasks.containsKey(task)
@@ -538,6 +544,12 @@ final class DesktopDownloader extends BaseDownloader {
         maxConcurrent = maxConcurrentParam ?? 10;
         maxConcurrentByHost = maxConcurrentByHostParam ?? unlimited;
         maxConcurrentByGroup = maxConcurrentByGroupParam ?? unlimited;
+
+      case (Config.holdingQueue, Config.never):
+      case (Config.holdingQueue, false):
+        maxConcurrent = unlimited;
+        maxConcurrentByHost = unlimited;
+        maxConcurrentByGroup = unlimited;
 
       default:
         return (

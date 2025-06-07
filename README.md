@@ -96,6 +96,7 @@ final successfullyEnqueued = await FileDownloader().enqueue(DownloadTask(
                                 url: 'https://google.com',
                                 filename: 'google.html',
                                 updates: Updates.statusAndProgress));
+
 ```
 
 **Note:** If you need to enqueue a large number of tasks, create a list of `Task` objects and use `FileDownloader().enqueueAll(tasks)` for better, non-blocking performance.
@@ -456,7 +457,8 @@ print('TaskId ${record.taskId} with task ${record.task} has '
 ```
 
 You can interact with the `database` using `allRecords`, `allRecordsOlderThan`, `recordForId`,`deleteAllRecords`,
-`deleteRecordWithId` etc. If you only want to track tasks in a specific [group](#grouping-tasks), call `trackTasksInGroup` instead.
+`deleteRecordWithId` etc. If you only want to track tasks in a specific [group](#grouping-tasks), call `trackTasksInGroup` instead. 
+To listen to changes to the database, use the `FileDownloader().database.updates` stream of `TaskRecord` items, emitted after a record has been updated in the database. This is a `BroadcastStream`, so multiple listeners can attach/detach and re-attach to the stream, which makes it easy to use in UI components. Make sure to cancel your `StreamSubscription` appropriately.
 
 If a user kills your app (e.g. by swiping it away in the app tray) then tasks that are running (natively) are killed, and no indication is given to your application. This cannot be avoided. To guard for this, upon app startup you can ask the downloader to reschedule killed tasks, i.e. tasks that show up as `enqueued` or `running` in the database, yet are not enqueued or running on the native side, or are `waitingToRetry` but not registered as such. Method `rescheduleKilledTasks` returns a record with two lists, 1) successfully rescheduled tasks and 2) tasks that failed to reschedule. Together, those are the missing tasks. Reschedule missing tasks a few seconds after you have called `resumeFromBackground`, as that gives the downloader time to processes updates that may have happened while the app was suspended, or call `FileDownloader().start()` with `doRescheduleKilledTasks` set to true (the default).
 
@@ -702,6 +704,11 @@ Uploads are very similar to downloads, except:
 
 There are two ways to upload a file to a server: binary upload (where the file is included in the POST body) and form/multi-part upload. Which type of upload is appropriate depends on the server you are uploading to. The upload will be done using the binary upload method only if you have set the `post` field of the `UploadTask` to 'binary'.
 
+For binary uploads, the `Content-Disposition` header sent to the server will be:
+- set to 'attachment = "filename"' if the task.headers field does not contain an entry for 'Content-Disposition' (with 'filename' replaced by the actual filename)
+- not set at all (i.e. omitted) if the task.headers field contains an entry for 'Content-Disposition' with the value '' (an empty string)
+- set to the value of `task.headers['Content-Disposition']` in all other cases
+
 ### Single file upload
 
 If you already have a `File` object, you can create your `UploadTask` using `UploadTask.fromFile`, though note that this will create a task with an absolute path reference and `BaseDirectory.root`, which can cause problems on mobile platforms (see [here](#specifying-the-location-of-the-file-to-download-or-upload)). Preferably, use `Task.split` to break your `File` or filePath into appropriate baseDirectory, directory and filename and use that to create your `UploadTask`.
@@ -742,10 +749,14 @@ Parallel downloads do not support the use of URIs.
 To enable pausing, set the `allowPause` field of the `Task` to `true`. This may also cause the task to `pause` un-commanded. For example, the OS may choose to pause the task if someone walks out of WiFi coverage.
 
 To cancel, pause or resume a task, call:
+* `cancel` to cancel a task
+* `cancelAll` to cancel all tasks currently running, a specific list of tasks, or all tasks in a `group`.
 * `cancelTaskWithId` to cancel the tasks with that taskId
 * `cancelTasksWithIds` to cancel all tasks with a `taskId` in the provided list of taskIds
 * `pause` to attempt to pause a task. Pausing is only possible for download GET requests, only if the `Task.allowPause` field is true, and only if the server supports pause/resume. Soon after the task is running (`TaskStatus.running`) you can call `taskCanResume` which will return a Future that resolves to `true` if the server appears capable of pause & resume. If it is not, then `pause` will have no effect and return false
+* `pauseAll` to attempt to pause a all tasks currently running, a specific list of tasks, or all tasks in a `group`. Returns a list of tasks that were paused
 * `resume` to resume a previously paused task (or certain failed tasks), which returns true if resume appears feasible. The task status will follow the same sequence as a newly enqueued task. If resuming turns out to be not feasible (e.g. the operating system deleted the temp file with the partial download) then the task will either restart as a normal download, or fail.
+* `resumeAll` to resume all tasks currently paused, a specific list of tasks, or all tasks in a `group`. Returns a list of tasks that were resumed
 
 
 To manage or query the queue of waiting or running tasks, call:

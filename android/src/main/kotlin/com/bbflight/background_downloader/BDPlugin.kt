@@ -42,10 +42,12 @@ import java.lang.Long.min
 import java.net.MalformedURLException
 import java.net.URL
 import java.net.URLDecoder
+import java.util.Collections
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
+import androidx.core.content.edit
 
 
 /**
@@ -82,24 +84,33 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
 
 
         @SuppressLint("StaticFieldLeak")
-        var notificationButtonText = mutableMapOf<String, String>() // for localization
+        var notificationButtonText =
+            Collections.synchronizedMap(mutableMapOf<String, String>()) // for localization
         var firstBackgroundChannel: MethodChannel? = null
-        var bgChannelByTaskId = mutableMapOf<String, MethodChannel>()
-        var flutterEngineByTaskId = mutableMapOf<String, FlutterEngine>()
+        var bgChannelByTaskId = Collections.synchronizedMap(mutableMapOf<String, MethodChannel>())
+        var flutterEngineByTaskId =
+            Collections.synchronizedMap(mutableMapOf<String, FlutterEngine>())
         var requireWifi = RequireWiFi.asSetByTask // global setting
         val localResumeData =
-            mutableMapOf<String, ResumeData>() // by taskId, for pause notifications
-        var cancelUpdateSentForTaskId = mutableMapOf<String, Long>() // <taskId, timeMillis>
-        val pausedTaskIds = mutableSetOf<String>() // <taskId>, acts as flag
-        val canceledTaskIds = mutableSetOf<String>() // <taskId>, acts as flag
-        val parallelDownloadTaskWorkers = HashMap<String, ParallelDownloadTaskWorker>()
-        val tasksToReEnqueue = mutableSetOf<Task>() // for when WiFi requirement changes
+            Collections.synchronizedMap(mutableMapOf<String, ResumeData>()) // by taskId, for pause notifications
+        var cancelUpdateSentForTaskId =
+            Collections.synchronizedMap(mutableMapOf<String, Long>()) // <taskId, timeMillis>
+        val pausedTaskIds =
+            Collections.synchronizedSet(mutableSetOf<String>()) // <taskId>, acts as flag
+        val canceledTaskIds =
+            Collections.synchronizedSet(mutableSetOf<String>()) // <taskId>, acts as flag
+        val parallelDownloadTaskWorkers =
+            Collections.synchronizedMap(HashMap<String, ParallelDownloadTaskWorker>()) //Was a HashMap
+        val tasksToReEnqueue =
+            Collections.synchronizedSet(mutableSetOf<Task>()) // for when WiFi requirement changes
         val taskIdsRequiringWiFi =
-            mutableSetOf<String>() // ensures correctness when enqueueing task
-        val notificationConfigJsonStrings = mutableMapOf<String, String>() // by taskId
+            Collections.synchronizedSet(mutableSetOf<String>()) // ensures correctness when enqueueing task
+        val notificationConfigJsonStrings =
+            Collections.synchronizedMap(mutableMapOf<String, String>()) // by taskId
         var forceFailPostOnBackgroundChannel = false
         val prefsLock = ReentrantReadWriteLock()
-        val remainingBytesToDownload = mutableMapOf<String, Long>() // <taskId, size>
+        val remainingBytesToDownload =
+            Collections.synchronizedMap(mutableMapOf<String, Long>()) // <taskId, size>
         var haveLoggedProxyMessage = false
         var holdingQueue: HoldingQueue? = null
 
@@ -203,9 +214,9 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 val prefs = PreferenceManager.getDefaultSharedPreferences(context)
                 val tasksMap = getTaskMap(prefs)
                 tasksMap[task.taskId] = task
-                val editor = prefs.edit()
-                editor.putString(keyTasksMap, Json.encodeToString(tasksMap))
-                editor.apply()
+                prefs.edit {
+                    putString(keyTasksMap, Json.encodeToString(tasksMap))
+                }
             }
             return true
         }
@@ -385,10 +396,12 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         val workManager = WorkManager.getInstance(applicationContext)
         val allWorkInfos = workManager.getWorkInfosByTag(TAG).get()
         if (allWorkInfos.isEmpty()) {
-            // remove persistent storage if no jobs found at all
-            val editor = prefs.edit()
-            editor.remove(keyTasksMap)
-            editor.apply()
+            prefsLock.write {
+                // remove persistent storage if no jobs found at all
+                prefs.edit {
+                    remove(keyTasksMap)
+                }
+            }
         }
         requireWifi = RequireWiFi.entries[prefs.getInt(keyRequireWiFi, 0)]
     }
@@ -424,6 +437,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 "killTaskWithId" -> methodKillTaskWithId(call, result)
                 "taskForId" -> methodTaskForId(call, result)
                 "pause" -> methodPause(call, result)
+                "pauseAll" -> methodPauseAll(call, result)
                 "updateNotification" -> methodUpdateNotification(call, result)
                 "moveToSharedStorage" -> methodMoveToSharedStorage(call, result)
                 "pathInSharedStorage" -> methodPathInSharedStorage(call, result)
@@ -541,69 +555,79 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * Returns a list of booleans indicating the success of each individual enqueue operation.
      */
-    private suspend fun methodEnqueueAll(call: MethodCall, result: Result) {
-        val args = call.arguments as List<*>
-        val taskListJsonString = args[0] as String
-        val notificationConfigListJsonString = args[1] as String
-
-        try {
-            val tasks = Json.decodeFromString<List<Task>>(taskListJsonString)
-            val notificationConfigs =
-                Json.decodeFromString<List<NotificationConfig?>>(notificationConfigListJsonString)
-            val results = mutableListOf<Boolean>()
-            for ((index, task) in tasks.withIndex()) {
-                val notificationConfig = notificationConfigs.getOrNull(index)
-                val notificationConfigJsonString =
-                    notificationConfig?.let { Json.encodeToString(it) }
-                try {
-                    URL(task.url)
-                    withContext(Dispatchers.IO) {
-                        URLDecoder.decode(task.url, "UTF-8")
+    private fun methodEnqueueAll(call: MethodCall, result: Result) {
+        if (scope == null) {
+            result.success(emptyList<Boolean>())
+            return
+        }
+        val plugin = this
+        scope!!.launch(Dispatchers.IO) {
+            val args = call.arguments as List<*>
+            val taskListJsonString = args[0] as String
+            val notificationConfigListJsonString = args[1] as String
+            try {
+                val tasks = Json.decodeFromString<List<Task>>(taskListJsonString)
+                val notificationConfigs =
+                    Json.decodeFromString<List<NotificationConfig?>>(
+                        notificationConfigListJsonString
+                    )
+                val results = mutableListOf<Boolean>()
+                for ((index, task) in tasks.withIndex()) {
+                    val notificationConfig = notificationConfigs.getOrNull(index)
+                    val notificationConfigJsonString =
+                        notificationConfig?.let { Json.encodeToString(it) }
+                    var success = false
+                    try {
+                        try {
+                            URL(task.url)
+                            URLDecoder.decode(task.url, "UTF-8")
+                        } catch (_: MalformedURLException) {
+                            Log.i(TAG, "MalformedURLException for taskId ${task.taskId}")
+                            results.add(false)
+                            continue
+                        } catch (_: IllegalArgumentException) {
+                            Log.i(TAG, "Could not url-decode url for taskId ${task.taskId}")
+                            results.add(false)
+                            continue
+                        }
+                        // Enqueue or add to HoldingQueue
+                        success = if (holdingQueue == null) {
+                            doEnqueue(
+                                applicationContext,
+                                task,
+                                notificationConfigJsonString,
+                                resumeData = null,
+                                plugin = plugin
+                            )
+                        } else {
+                            Log.i(TAG, "Enqueueing task with id ${task.taskId} to the HoldingQueue")
+                            holdingQueue?.add(
+                                EnqueueItem(
+                                    context = applicationContext,
+                                    task = task,
+                                    notificationConfigJsonString = notificationConfigJsonString,
+                                    resumeData = null,
+                                    plugin = plugin
+                                )
+                            )
+                            processStatusUpdate(
+                                task,
+                                TaskStatus.enqueued,
+                                PreferenceManager.getDefaultSharedPreferences(applicationContext),
+                                context = applicationContext
+                            )
+                            true
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error processing task ${task.taskId}: ${e.message}")
                     }
-                } catch (_: MalformedURLException) {
-                    Log.i(TAG, "MalformedURLException for taskId ${task.taskId}")
-                    results.add(false)
-                    continue
-                } catch (_: IllegalArgumentException) {
-                    Log.i(TAG, "Could not url-decode url for taskId ${task.taskId}")
-                    results.add(false)
-                    continue
+                    results.add(success)
                 }
-                // Enqueue or add to HoldingQueue
-                if (holdingQueue == null) {
-                    results.add(
-                        doEnqueue(
-                            applicationContext,
-                            task,
-                            notificationConfigJsonString,
-                            resumeData = null,
-                            plugin = this
-                        )
-                    )
-                } else {
-                    Log.i(TAG, "Enqueueing task with id ${task.taskId} to the HoldingQueue")
-                    holdingQueue?.add(
-                        EnqueueItem(
-                            context = applicationContext,
-                            task = task,
-                            notificationConfigJsonString = notificationConfigJsonString,
-                            resumeData = null,
-                            plugin = this
-                        )
-                    )
-                    processStatusUpdate(
-                        task,
-                        TaskStatus.enqueued,
-                        PreferenceManager.getDefaultSharedPreferences(applicationContext),
-                        context = applicationContext
-                    )
-                    results.add(true)
-                }
+                result.success(results)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error decoding JSON: ${e.message}")
+                result.success(emptyList<Boolean>()) // Return an empty list on error
             }
-            result.success(results)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error decoding JSON or processing tasks: ${e.message}")
-            result.success(emptyList<Boolean>()) // Return an empty list on error
         }
     }
 
@@ -690,9 +714,17 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * Returns true if all cancellations were successful
      */
-    private suspend fun methodCancelTasksWithIds(call: MethodCall, result: Result) {
-        @Suppress("UNCHECKED_CAST") val taskIds = call.arguments as List<String>
-        result.success(cancelTasksWithIds(applicationContext, taskIds))
+    private fun methodCancelTasksWithIds(call: MethodCall, result: Result) {
+        if (scope == null) {
+            result.success(false) // Or handle the error appropriately
+            return
+        }
+        scope!!.launch(Dispatchers.IO) {
+            @Suppress("UNCHECKED_CAST") val taskIds = call.arguments as List<String>
+            withContext(Dispatchers.Main) {
+                result.success(cancelTasksWithIds(applicationContext, taskIds))
+            }
+        }
     }
 
     /**
@@ -750,6 +782,24 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     private fun methodPause(call: MethodCall, result: Result) {
         val taskId = call.arguments as String
         result.success(pauseTaskWithId(taskId))
+    }
+
+    /**
+     * Marks all taskIds for pausing
+     */
+    private fun methodPauseAll(call: MethodCall, result: Result) {
+        val taskIds = call.arguments as? List<*> ?: run {
+            result.error("INVALID_ARGUMENT", "Expected a list of task IDs", null)
+            return
+        }
+        val results = taskIds.map { taskId ->
+            if (taskId is String) {
+                pauseTaskWithId(taskId)
+            } else {
+                false
+            }
+        }
+        result.success(results)
     }
 
     /**
@@ -815,9 +865,9 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         prefsLock.write {
             val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
             val jsonString = prefs.getString(prefsKey, "{}")
-            val editor = prefs.edit()
-            editor.remove(prefsKey)
-            editor.apply()
+            prefs.edit {
+                remove(prefsKey)
+            }
             result.success(jsonString)
         }
     }
@@ -1151,10 +1201,14 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      */
     private fun methodConfigHoldingQueue(call: MethodCall, result: Result) {
         val arguments = call.arguments as List<*>
-        holdingQueue = holdingQueue ?: HoldingQueue(WorkManager.getInstance(applicationContext))
-        holdingQueue?.maxConcurrent = arguments[0] as Int
-        holdingQueue?.maxConcurrentByHost = arguments[1] as Int
-        holdingQueue?.maxConcurrentByGroup = arguments[2] as Int
+        if (arguments.isEmpty()) { // deactivate the holding queue
+            holdingQueue = null
+        } else {
+            holdingQueue = holdingQueue ?: HoldingQueue(WorkManager.getInstance(applicationContext))
+            holdingQueue?.maxConcurrent = arguments[0] as Int
+            holdingQueue?.maxConcurrentByHost = arguments[1] as Int
+            holdingQueue?.maxConcurrentByGroup = arguments[2] as Int
+        }
         result.success(null)
     }
 
@@ -1187,7 +1241,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * For testing only
      *
      */
-    private suspend fun methodTestSuggestedFilename(call: MethodCall, result: Result) {
+    private fun methodTestSuggestedFilename(call: MethodCall, result: Result) {
         val args = call.arguments as List<*>
         val taskJsonMapString = args[0] as String
         val contentDisposition = args[1] as String

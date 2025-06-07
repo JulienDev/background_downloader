@@ -29,7 +29,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     static var progressInfo = [String: (lastProgressUpdateTime: TimeInterval,
                                         lastProgressValue: Double,
                                         lastTotalBytesDone: Int64,
-                                        lastNetworkSpeed: Double)]() // time, bytes, speed
+                                        lastNetworkSpeed: Double)]() // upadtetime, progress %, bytes, speed
     static var uploaderForUrlSessionTaskIdentifier = [Int:Uploader]() // maps from UrlSessionTask TaskIdentifier
     static var haveregisteredNotificationCategories = false
     static var requireWiFi = RequireWiFi.asSetByTask // global setting
@@ -97,6 +97,8 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
                 await methodTaskForId(call: call, result: result)
             case "pause":
                 await methodPause(call: call, result: result)
+            case "pauseAll":
+                await methodPauseAll(call: call, result: result)
             case "updateNotification":
                 methodUpdateNotification(call: call, result: result)
             case "moveToSharedStorage":
@@ -199,14 +201,12 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
                   let notificationConfigListJsonString = args[1] as? String,
                   let tasks = try? JSONDecoder().decode([Task].self, from: taskListJsonString.data(using: .utf8)!),
                   let notificationConfigs = try? JSONDecoder().decode([NotificationConfig?].self, from: notificationConfigListJsonString.data(using: .utf8)!) else {
-                os_log("Invalid arguments to enqueue: %@", log: log, String(describing: call.arguments))
+                os_log("Invalid arguments to enqueueAll: %@", log: log, String(describing: call.arguments))
                 postResult(result: result, value: [])
                 return
             }
-
             _Concurrency.Task.detached { // Run the loop off the main thread
                 var results: [Bool] = []
-
                 for (index, task) in tasks.enumerated() {
                     let notificationConfig = notificationConfigs.indices.contains(index) ? notificationConfigs[index] : nil
                     let notificationConfigJsonString = notificationConfig != nil ? try? String(data: JSONEncoder().encode(notificationConfig), encoding: .utf8) : nil
@@ -232,10 +232,9 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
                         results.append(true)
                     }
                 }
-
-                // Return results to the main thread *after* the loop completes
+                let finalResults = results
                 await MainActor.run {
-                    postResult(result: result, value: results)
+                    postResult(result: result, value: finalResults)
                 }
             }
         }
@@ -268,8 +267,11 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         var baseRequest = URLRequest(url: url)
         baseRequest.httpMethod = task.httpRequestMethod
         for (key, value) in task.headers {
-            // copy headers unless Range header in UploadTask
-            if key != "Range" || task.taskType != "UploadTask" {
+            // For UploadTask, copy headers
+            // unless it's "Range" or "Content-Disposition" (case-insensitive).
+            // For other task types, copy all headers.
+            if !isUploadTask(task: task) ||
+               (key.lowercased() != "range" && key.lowercased() != "content-disposition") {
                 baseRequest.setValue(value, forHTTPHeaderField: key)
             }
         }
@@ -309,6 +311,13 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     }
     
     /// Schedule an upload task
+    ///
+    /// For binary uploads, the mime-type will be set to [Task.mimeType] and the Content-Disposition header will be:
+    /// - set to 'attachment = "filename"' if the task.headers field does not contain
+    ///   an entry for 'Content-Disposition'
+    /// - not set at all (i.e. omitted) if the task.headers field contains an entry
+    ///   for 'Content-Disposition' with the value '' (an empty string)
+    /// - set to the value of task.headers['Content-Disposition'] in all other cases
     private func scheduleUpload(task: Task, taskDescription: String, baseRequest: URLRequest, notificationConfigJsonString: String?) async -> Bool  {
         var request = baseRequest
         if isBinaryUploadTask(task: task) {
@@ -354,11 +363,18 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
                 ? getMimeType(fromFilename: fileUrl.path)
                 : task.mimeType ?? "application/octet-stream"
             request.setValue(resolvedMimeType, forHTTPHeaderField: "Content-Type")
-            if let encodedFilename = filename?.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
-                request.setValue("attachment; filename=\"\(encodedFilename)\"", forHTTPHeaderField: "Content-Disposition")
-            } else {
-                os_log("Could not encode task.fileName %@", log: log, type: .info, task.filename)
-                return false
+            let taskContentDisposition = task.headers["Content-Disposition"] ?? task.headers["content-disposition"]
+            if (taskContentDisposition != "") {
+                if taskContentDisposition == nil {
+                    if let encodedFilename = filename?.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
+                        request.setValue("attachment; filename=\"\(encodedFilename)\"", forHTTPHeaderField: "Content-Disposition")
+                    } else {
+                        os_log("Could not encode task.fileName %@", log: log, type: .info, task.filename)
+                        return false
+                    }
+                } else {
+                    request.setValue(taskContentDisposition!, forHTTPHeaderField: "Content-Disposition")
+                }
             }
             var uploadFileUrl = fileUrl // if no range given
             if let rangeHeader = task.headers["Range"] {
@@ -509,54 +525,102 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         await BDPlugin.holdingQueue?.stateLock.unlock()
     }
     
+    
+    
     /// Pauses Task for this taskId. Returns true of pause likely successful, false otherwise
     ///
     /// If pause is not successful, task will be canceled (attempted)
     private func methodPause(call: FlutterMethodCall, result: @escaping FlutterResult) async {
         let taskId = call.arguments as! String
+        let pauseResult = await pauseSingleTask(taskId: taskId)
+        result(pauseResult)
+    }
+    
+    
+    /// Pauses a list of tasks.  Uses the same approach as methodEnqueueAll
+    ///
+    /// Returns a list of equal length of booleans indicating whether each individual pause succeeded
+    private func methodPauseAll(call: FlutterMethodCall, result: @escaping FlutterResult) async {
+        guard let taskIds = call.arguments as? [String] else {
+            result(FlutterError(code: "INVALID_ARGUMENT", message: "Expected a list of task IDs", details: nil))
+            return
+        }
+        
+        _Concurrency.Task.detached { // Run off the main thread
+            var results: [Bool] = []
+            for taskId in taskIds {
+                let pauseResult = await self.pauseSingleTask(taskId: taskId)
+                results.append(pauseResult)
+            }
+            
+            let finalResults = results
+            await MainActor.run { // Send results back to the main thread
+                result(finalResults)
+            }
+        }
+    }
+    
+    /// Attempts to pause a single task.
+    ///
+    /// - Parameter taskId: The ID of the task to pause.
+    /// - Returns: `true` if the pause was likely successful, `false` otherwise.
+    private func pauseSingleTask(taskId: String) async -> Bool {
         UrlSessionDelegate.createUrlSession()
         BDPlugin.propertyLock.withLock({
             _ = BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.insert(taskId)
         })
+        
         guard let urlSessionTask = await UrlSessionDelegate.getUrlSessionTaskWithId(taskId: taskId) as? URLSessionDownloadTask,
-              let task = await UrlSessionDelegate.getTaskWithId(taskId: taskId),
-              let resumeData = await urlSessionTask.cancelByProducingResumeData()
+              let task = await UrlSessionDelegate.getTaskWithId(taskId: taskId)
         else {
             // no regular task found, return if there's no ParalleldownloadTask either
             BDPlugin.propertyLock.withLock({
                 _ = BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.remove(taskId)
             })
-            if ParallelDownloader.downloads[taskId] == nil {
-                os_log("Could not pause task %@", log: log, type: .info, taskId)
-                result(false)
-            } else {
-                if await ParallelDownloader.downloads[taskId]?.pauseTask() == true {
+            if let parallelDownloadTask = ParallelDownloader.downloads[taskId] {
+                if await parallelDownloadTask.pauseTask() {
                     os_log("Paused task with taskId %@", log: log, type: .info, taskId)
-                    result(true)
+                    return true
                 } else {
                     os_log("Could not pause taskId %@", log: log, type: .info, taskId)
-                    result(false)
+                    return false
                 }
+            } else {
+                os_log("Could not pause task %@, or task not found", log: log, type: .info, taskId)
+                return false
             }
-            return
         }
+        
+        guard let resumeData = await urlSessionTask.cancelByProducingResumeData() else {
+            os_log("Could not pause task %@", log: log, type: .info, taskId)
+            BDPlugin.propertyLock.withLock({
+                _ = BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.remove(taskId)
+            })
+            return false
+        }
+        
         if processResumeData(task: task, resumeData: resumeData) {
             processStatusUpdate(task: task, status: .paused)
             os_log("Paused task with taskId %@", log: log, type: .info, taskId)
             // update 'paused' notification if needed
-            guard let notificationConfigJsonString = BDPlugin.notificationConfigJsonStrings[taskId],
-                  let notificationConfig = notificationConfigFrom(jsonString: notificationConfigJsonString)
-            else {
-                result(true)
-                return
+            if let notificationConfigJsonString = BDPlugin.notificationConfigJsonStrings[taskId],
+               let notificationConfig = notificationConfigFrom(jsonString: notificationConfigJsonString)
+            {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    updateNotification(task: task, notificationType: .paused, notificationConfig: notificationConfig)
+                }
             }
-            updateNotification(task: task, notificationType: .paused, notificationConfig: notificationConfig)
-            result(true)
+            BDPlugin.propertyLock.withLock({
+                _ = BDPlugin.progressInfo.removeValue(forKey: taskId) // ensure .running update on resume
+            })
+            return true
         } else {
             os_log("Could not post resume data for taskId %@: task paused but cannot be resumed", log: log, type: .info, taskId)
-            result(false)
+            return false
         }
     }
+    
+
     
     /// Update the notification for this task
     /// Args are:
@@ -779,10 +843,14 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     /// Configure the HoldingQueue (and create if necessary)
     private func methodConfigHoldingQueue(call: FlutterMethodCall, result: @escaping FlutterResult) {
         let args = call.arguments as! [Any]
-        BDPlugin.holdingQueue = BDPlugin.holdingQueue ?? HoldingQueue()
-        BDPlugin.holdingQueue?.maxConcurrent = args[0] as! Int
-        BDPlugin.holdingQueue?.maxConcurrentByHost = args[1] as! Int
-        BDPlugin.holdingQueue?.maxConcurrentByGroup = args[2] as! Int
+        if (args.isEmpty) { // deactivate the holding queue
+            BDPlugin.holdingQueue = nil
+        } else {
+            BDPlugin.holdingQueue = BDPlugin.holdingQueue ?? HoldingQueue()
+            BDPlugin.holdingQueue?.maxConcurrent = args[0] as! Int
+            BDPlugin.holdingQueue?.maxConcurrentByHost = args[1] as! Int
+            BDPlugin.holdingQueue?.maxConcurrentByGroup = args[2] as! Int
+        }
         result(nil)
     }
     

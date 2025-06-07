@@ -33,6 +33,17 @@ final class DesktopDownloader extends BaseDownloader {
   }
 
   @override
+  Future<List<DownloadTask>> pauseAll(
+      {Iterable<DownloadTask>? tasks, String? group}) {
+    throw UnimplementedError();
+  }
+
+  @override
+  Future<List<bool>> pauseTaskList(Iterable<Task> tasksToPause) {
+    throw UnimplementedError();
+  }
+
+  @override
   Future<(String, String)> configureItem((String, dynamic) configItem) {
     throw UnimplementedError();
   }
@@ -74,7 +85,7 @@ final class DesktopDownloader extends BaseDownloader {
   }
 
   @override
-  Future<List<bool>> enqueueAll(List<Task> tasks) {
+  Future<List<bool>> enqueueAll(Iterable<Task> tasks) {
     throw UnimplementedError();
   }
 }

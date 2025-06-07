@@ -237,7 +237,7 @@ abstract base class NativeDownloader extends BaseDownloader {
   }
 
   @override
-  Future<List<bool>> enqueueAll(List<Task> tasks) async {
+  Future<List<bool>> enqueueAll(Iterable<Task> tasks) async {
     for (final task in tasks.where((task) => task.allowPause)) {
       canResumeTask[task] = Completer();
     }
@@ -253,7 +253,10 @@ abstract base class NativeDownloader extends BaseDownloader {
   }
 
   static (String, String) _taskAndNotificationConfigJsonStrings(
-      (List<Task>, Set<TaskNotificationConfig>) tasksAndNotificationConfigs) {
+      (
+        Iterable<Task>,
+        Set<TaskNotificationConfig>
+      ) tasksAndNotificationConfigs) {
     final (tasks, notificationConfigs) = tasksAndNotificationConfigs;
     final tasksJsonString = jsonEncode(tasks);
     final configs = tasks
@@ -308,6 +311,15 @@ abstract base class NativeDownloader extends BaseDownloader {
   @override
   Future<bool> pause(Task task) async =>
       await methodChannel.invokeMethod<bool>('pause', task.taskId) ?? false;
+
+  @override
+  Future<List<bool>> pauseTaskList(Iterable<Task> tasksToPause) async {
+    final taskIds =
+        tasksToPause.map((task) => task.taskId).toList(growable: false);
+    final results =
+        await methodChannel.invokeMethod<List<Object?>>('pauseAll', taskIds);
+    return results?.cast<bool>() ?? tasksToPause.map((task) => false).toList();
+  }
 
   @override
   Future<bool> resume(Task task) async {
@@ -477,6 +489,11 @@ abstract base class NativeDownloader extends BaseDownloader {
           maxConcurrentByGroup ?? 1 << 20
         ]);
 
+      case (Config.holdingQueue, Config.never):
+      case (Config.holdingQueue, false):
+        await NativeDownloader.methodChannel
+            .invokeMethod('configHoldingQueue', []);
+
       default:
         return (
           configItem.$1,
@@ -505,7 +522,7 @@ final class AndroidDownloader extends NativeDownloader {
   }
 
   @override
-  Future<List<bool>> enqueueAll(List<Task> tasks) async {
+  Future<List<bool>> enqueueAll(Iterable<Task> tasks) async {
     for (final task in tasks) {
       await _registerCallbackDispatcher(task);
     }

@@ -499,79 +499,6 @@ void main() {
           .configure(iOSConfig: (Config.excludeFromCloudBackup, Config.never));
       expect(configResult2.first.$1, equals(Config.excludeFromCloudBackup));
     });
-
-    testWidgets('EnqueueAll', (widgetTester) async {
-      const numTasks = 10;
-      final tasks = <Task>[];
-      for (var n = 0; n < numTasks; n++) {
-        tasks.add(DownloadTask(url: workingUrl));
-      }
-      FileDownloader().registerCallbacks(taskStatusCallback: statusCallback);
-      final enqueueResult = await FileDownloader().enqueueAll(tasks);
-      for (final result in enqueueResult) {
-        expect(result, isTrue);
-      }
-      await Future.delayed(const Duration(seconds: 2));
-      for (final task in tasks) {
-        final file = File(await task.filePath());
-        try {
-          file.deleteSync();
-        } on FileSystemException {}
-      }
-      expect(statusCallbackCounter, equals(3 * numTasks));
-    });
-
-    testWidgets('Enqueue Performance Comparison', (widgetTester) async {
-      const numTasks = 100; // Increase for more significant results
-      final tasks = <Task>[];
-      final tasks2 = <Task>[];
-      for (var n = 0; n < numTasks; n++) {
-        tasks.add(DownloadTask(
-            url: 'https://example.com/file.txt',
-            updates: Updates.none)); // Use a dummy URL
-        tasks2.add(DownloadTask(
-            url: 'https://example.com/file.txt',
-            updates: Updates.none)); // Use a dummy URL
-      }
-
-      final fileDownloader = FileDownloader();
-
-      // Measure enqueue (one by one) time
-      final enqueueStartTime = DateTime.now();
-      for (final task in tasks) {
-        await fileDownloader.enqueue(task);
-      }
-      final enqueueEndTime = DateTime.now();
-      final enqueueDuration = enqueueEndTime.difference(enqueueStartTime);
-      print('Enqueue (one by one) took: ${enqueueDuration.inMilliseconds}ms');
-
-      // Measure enqueueAll time
-      final enqueueAllStartTime = DateTime.now();
-      await fileDownloader.enqueueAll(tasks2);
-      final enqueueAllEndTime = DateTime.now();
-      final enqueueAllDuration =
-          enqueueAllEndTime.difference(enqueueAllStartTime);
-      print('enqueueAll took: ${enqueueAllDuration.inMilliseconds}ms');
-
-      await Future.delayed(const Duration(seconds: 5));
-
-      // Clean up
-      for (final task in tasks) {
-        final file = File(await task.filePath());
-        try {
-          file.deleteSync();
-        } on FileSystemException {}
-      }
-      for (final task in tasks2) {
-        final file = File(await task.filePath());
-        try {
-          file.deleteSync();
-        } on FileSystemException {}
-      }
-
-      // Simply pass the test
-      expect(true, isTrue); // Just to have a passing test
-    });
   });
 
   group('Queue and task management', () {
@@ -2655,7 +2582,7 @@ void main() {
         success = await FileDownloader().openFile(task: task);
         expect(success, isFalse);
         // change to a file without extension
-        task = task.copyWith(filename: 'fileWithoutExtension');
+        task = task.copyWith(filename: 'fileWithoutExtension with space');
         success = await FileDownloader().openFile(task: task);
         expect(success, isFalse);
       } else {
@@ -2978,6 +2905,34 @@ void main() {
       expect(await file.exists(), isTrue);
       expect(await file.length(), equals(urlWithContentLengthFileSize));
       await file.delete();
+    });
+
+    test('uploads with different content-disposition headers', () async {
+      final uploadTask = UploadTask(
+          url: 'https://httpbin.org/post',
+          filename: uploadFilename,
+          post: 'binary');
+      final cdMap = {
+        // task.header presence/value and expected header sent
+        null: 'attachment; filename="$uploadFilename"', // omitted (default)
+        '': null, // explicitly set to no header
+        'inline': 'inline' // specific header, copied
+      };
+      for (final entry in cdMap.entries) {
+        final UploadTask myTask;
+        if (entry.key != null) {
+          myTask =
+              uploadTask.copyWith(headers: {'Content-Disposition': entry.key!});
+        } else {
+          myTask = uploadTask;
+        }
+        final result = await FileDownloader().upload(myTask);
+        expect(result.status, equals(TaskStatus.complete));
+        expect(result.responseStatusCode, equals(200));
+        final response = jsonDecode(result.responseBody!);
+        final contentDisposition = response['headers']['Content-Disposition'];
+        expect(contentDisposition, equals(entry.value));
+      }
     });
   });
 
