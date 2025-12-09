@@ -548,12 +548,16 @@ open class TaskWorker(
      * Returns the [TaskStatus]
      * */
     open suspend fun connectAndProcess(connection: HttpURLConnection): TaskStatus {
-
         try {
             if ((task.isDownloadTask() || task.isDataTask()) && task.post != null) {
+                val bytes = task.post!!.toByteArray();
+
                 connection.doOutput = true
-                connection.setFixedLengthStreamingMode(lengthInBytes(task.post!!))
-                DataOutputStream(connection.outputStream).use { it.writeBytes(task.post) }
+                connection.setFixedLengthStreamingMode(bytes.size)
+                DataOutputStream(connection.outputStream).use {
+                    it.write(bytes)
+                    it.flush()
+                }
             }
             return process(connection)
         } catch (e: Exception) {

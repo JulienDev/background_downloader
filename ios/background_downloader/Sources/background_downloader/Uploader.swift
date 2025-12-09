@@ -92,9 +92,8 @@ public class Uploader : NSObject, URLSessionTaskDelegate, StreamDelegate {
                 return false
             }
             let derivedFilename = path.components(separatedBy: "/").last!
-            if filesData.count == 1 {
+            if filesData.count == 1 && task.taskType != "MultiUploadTask" {
                 // only for single file uploads do we set the task's filename property
-                
                 let newTask = task.copyWith(filename: maybeFileUri != nil
                                             ? pack(filename: derivedFilename, uri: maybeFileUri!)
                                             : derivedFilename)
@@ -165,7 +164,13 @@ public class Uploader : NSObject, URLSessionTaskDelegate, StreamDelegate {
                 return true
             }
             let data = Data.init(bytesNoCopy: buffer, count: bytesRead, deallocator: .none)
-            fileHandle.write(data)
+            do {
+                try fileHandle.write(contentsOf: data)
+            } catch {
+                os_log("Error writing to file for taskId %@: %@", log: log, type: .error, task.taskId, error.localizedDescription)
+                inputStream.close()
+                return false
+            }
         }
         inputStream.close()
         return true
@@ -176,7 +181,12 @@ public class Uploader : NSObject, URLSessionTaskDelegate, StreamDelegate {
         guard let epilogue = text.data(using: .utf8) else {
             return false
         }
-        fileHandle.write(epilogue)
+        do {
+            try fileHandle.write(contentsOf: epilogue)
+        } catch {
+            os_log("Error writing to file for taskId %@: %@", log: log, type: .error, task.taskId, error.localizedDescription)
+            return false
+        }
         totalBytesWritten += Int64(epilogue.count)
         return true
     }
@@ -194,7 +204,7 @@ public class Uploader : NSObject, URLSessionTaskDelegate, StreamDelegate {
          var header = "Content-Disposition: form-data; name=\"\(browserEncode(name))\""
         if isJsonString(value) {
             header = "\(header)\r\n" +
-            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Type: application/json; charset=utf-8"
         } else if !isPlainAscii(value) {
             header = "\(header)\r\n" +
             "Content-Type: text/plain; charset=utf-8\r\n" +

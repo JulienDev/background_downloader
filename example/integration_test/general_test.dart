@@ -1059,6 +1059,49 @@ void main() {
               'please check your spelling and try again.</p>\n'));
       expect(result.responseStatusCode, equals(404));
     });
+
+    testWidgets('skipExistingFiles', (widgetTester) async {
+      // Test skipping a file that already exists
+      final task = DownloadTask(url: workingUrl, filename: 'existing.html');
+      final path =
+          join((await getApplicationDocumentsDirectory()).path, task.filename);
+      var dummyContent = 'dummy content';
+      await File(path).writeAsString(dummyContent);
+
+      await FileDownloader().configure(
+          globalConfig: (Config.skipExistingFiles, Config.always)); // maps to 0
+      var result = await FileDownloader().download(task);
+      expect(result.status, equals(TaskStatus.complete));
+      expect(result.responseStatusCode, equals(304));
+      expect(File(path).readAsStringSync(), equals(dummyContent));
+
+      // Test with file size condition
+      await FileDownloader()
+          .configure(globalConfig: (Config.skipExistingFiles, 0)); // 0 MB
+      result = await FileDownloader().download(task);
+      expect(result.status, equals(TaskStatus.complete));
+      expect(result.responseStatusCode, equals(304)); // dummy content is > 0
+      expect(File(path).readAsStringSync(), equals(dummyContent));
+
+      await FileDownloader()
+          .configure(globalConfig: (Config.skipExistingFiles, 1)); // 1 MB
+      result = await FileDownloader().download(task);
+      expect(
+          result.status, equals(TaskStatus.complete)); // should download again
+      expect(result.responseStatusCode, equals(200));
+      expect(File(path).readAsStringSync(), isNot(equals(dummyContent)));
+
+      await File(path).writeAsString(dummyContent);
+      await FileDownloader().configure(
+          globalConfig: (Config.skipExistingFiles, Config.never)); // maps to -1
+      result = await FileDownloader().download(task);
+      expect(
+          result.status, equals(TaskStatus.complete)); // should download again
+      expect(result.responseStatusCode, equals(200));
+      expect(File(path).readAsStringSync(), isNot(equals(dummyContent)));
+
+      await File(path).delete();
+    });
   });
 
   group('Retries', () {
@@ -3109,6 +3152,26 @@ void main() {
       expect(elapsedTime.inMilliseconds, greaterThan(20));
     });
 
+    testWidgets('TaskQueue pauseAll', (widgetTester) async {
+      final tq = MemoryTaskQueue();
+      tq.maxConcurrent = 1;
+      FileDownloader().addTaskQueue(tq);
+      final task1 = DownloadTask(url: urlWithLongContentLength);
+      final task2 = DownloadTask(url: urlWithLongContentLength);
+      tq.add(task1);
+      tq.add(task2);
+      await Future.delayed(
+          const Duration(milliseconds: 500)); // allow first task to start
+      await FileDownloader().pauseAll();
+      await Future.delayed(const Duration(
+          seconds: 2)); // allow for second task to start if not paused
+      expect(tq.numActive, equals(1));
+      expect(tq.numWaiting, equals(1));
+      // cleanup
+      await FileDownloader().cancelAll();
+      FileDownloader().removeTaskQueue(tq);
+    });
+
     testWidgets('TaskQueue', (widgetTester) async {
       final completer = Completer<bool>();
       final tasks = <Task>{};
@@ -3524,14 +3587,14 @@ void main() {
           url: dataTaskPostUrl,
           headers: dataTaskHeaders); // without 'POST' will fail
       expect(await FileDownloader().enqueue(t), isTrue);
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(seconds: 5));
       expect(lastUpdate.status, equals(TaskStatus.failed));
       final t2 = DataTask(
           url: dataTaskPostUrl,
           headers: dataTaskHeaders,
           httpRequestMethod: 'POST'); // with 'POST' will succeed
       expect(await FileDownloader().enqueue(t2), isTrue);
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(seconds: 3));
       expect(lastUpdate.status, equals(TaskStatus.complete));
       print(lastUpdate.responseBody);
       final json = jsonDecode(lastUpdate.responseBody!);
@@ -3551,7 +3614,7 @@ void main() {
           headers: dataTaskHeaders,
           post: 'My data'); // should auto set 'POST' method
       expect(await FileDownloader().enqueue(t), isTrue);
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(seconds: 3));
       print(lastUpdate.responseStatusCode);
       expect(lastUpdate.status, equals(TaskStatus.complete));
       print(lastUpdate.responseBody);
@@ -3571,7 +3634,7 @@ void main() {
       final t = DataTask(
           url: dataTaskPostUrl, headers: dataTaskHeaders, json: jsonData);
       expect(await FileDownloader().enqueue(t), isTrue);
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(seconds: 3));
       print(lastUpdate.responseStatusCode);
       expect(lastUpdate.status, equals(TaskStatus.complete));
       print(lastUpdate.responseBody);
@@ -3592,7 +3655,7 @@ void main() {
           url: 'https://httpbin.org/status/400', // force 400 code
           headers: dataTaskHeaders);
       expect(await FileDownloader().enqueue(t), isTrue);
-      await Future.delayed(const Duration(seconds: 2));
+      await Future.delayed(const Duration(seconds: 3));
       expect(lastUpdate.status, equals(TaskStatus.failed));
       final exception = lastUpdate.exception!;
       print(exception);
@@ -3615,7 +3678,7 @@ void main() {
           headers: dataTaskHeaders,
           retries: 2);
       expect(await FileDownloader().enqueue(t), isTrue);
-      await Future.delayed(const Duration(seconds: 10));
+      await Future.delayed(const Duration(seconds: 20));
       expect(lastUpdate.status, equals(TaskStatus.failed));
       expect(lastUpdate.task.retries, equals(2));
       expect(lastUpdate.task.retriesRemaining, equals(0));

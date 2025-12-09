@@ -140,6 +140,7 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
                         }
                         BDPlugin.propertyLock.withLock({
                             _ = BDPlugin.progressInfo.removeValue(forKey: bgdTask.taskId) // ensure .running update on resume
+                            BDPlugin.initialResponseDataProcessed.remove(bgdTask.taskId)
                         })
                         return
                     }
@@ -190,71 +191,77 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
             BDPlugin.progressInfo[task.taskId]
         })
         if progressInfo == nil {
-            // first 'didWriteData' call
+            // first 'didWriteData' call, so send 'running' status update and show notification
             os_log("Starting/resuming taskId %@", log: log, type: .info, task.taskId)
-            let response = downloadTask.response as! HTTPURLResponse
-            // get suggested filename if needed
-            let (filename, uri) = unpack(packedString: task.filename)
-            if filename == "?" {
-                if (uri == nil) {
-                    let newTask = taskWithSuggestedFilenameFromResponseHeaders(task: task, responseHeaders: response.allHeaderFields)
-                    if newTask.filename != task.filename {
-                        storeModifiedTask(task: newTask)
-                        task = newTask
-                    }
-                } else {
-                    let suggestedFilename = suggestFilename(responseHeaders: response.allHeaderFields, urlString: task.url)
-                    let packed = pack(filename: suggestedFilename.isEmpty ? "unknown" : suggestedFilename, uri: uri!)
-                    let newTask = task.copyWith(filename: packed)
-                    storeModifiedTask(task: newTask)
-                    task = newTask
-                }
-            }
-            extractContentType(responseHeaders: response.allHeaderFields, task: task)
-            // obtain content length override, if needed and available
-            if totalBytesExpectedToWrite == -1 {
-                let contentLength = getContentLength(responseHeaders: response.allHeaderFields, task: task)
-                if contentLength != -1 {
-                    BDPlugin.propertyLock.withLock({
-                        BDPlugin.tasksWithContentLengthOverride[task.taskId] = contentLength
-                    })
-                }
-            }
-            // Check if there is enough space
-            if insufficientSpace(contentLength: totalBytesExpectedToWrite) {
-                let notProgrammaticallyCancelled = BDPlugin.propertyLock.withLock({
-                    !BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.contains(task.taskId)
-                })
-                if notProgrammaticallyCancelled {
-                    os_log("Error for taskId %@: Insufficient space to store the file to be downloaded", log: log, type: .error, task.taskId)
-                    processStatusUpdate(task: task, status: .failed, taskException: TaskException(type: .fileSystem, httpResponseCode: -1, description: "Insufficient space to store the file to be downloaded for taskId \(task.taskId)"))
-                    BDPlugin.propertyLock.withLock({
-                        _ = BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.insert(task.taskId)
-                    })
-                    downloadTask.cancel()
-                }
-                return
-            }
-            // Send 'running' status update and check if the task is resumable
             processStatusUpdate(task: task, status: TaskStatus.running)
             processProgressUpdate(task: task, progress: 0.0)
             BDPlugin.propertyLock.withLock({
                 BDPlugin.progressInfo[task.taskId] = (lastProgressUpdateTime: 0, lastProgressValue: 0.0, lastTotalBytesDone: 0, lastNetworkSpeed: -1.0)
             })
-            if task.allowPause {
-                let acceptRangesHeader = (downloadTask.response as? HTTPURLResponse)?.allHeaderFields["Accept-Ranges"]
-                let taskCanResume = acceptRangesHeader as? String == "bytes"
-                processCanResume(task: task, taskCanResume: taskCanResume)
-                if taskCanResume {
-                    BDPlugin.propertyLock.withLock({
-                        _ = BDPlugin.taskIdsThatCanResume.insert(task.taskId)
-                    })
-                }
-            }
-            // notify if needed
             let notificationConfig = getNotificationConfigFrom(urlSessionTask: downloadTask)
             if (notificationConfig != nil) {
                 updateNotification(task: task, notificationType: .running, notificationConfig: notificationConfig)
+            }
+        }
+        if !BDPlugin.propertyLock.withLock({ BDPlugin.initialResponseDataProcessed.contains(task.taskId) }) {
+            // response can be nil in cases when progressInfo is nil due to app resuming in foreground
+            if let response = downloadTask.response as? HTTPURLResponse {
+                BDPlugin.propertyLock.withLock( {
+                    BDPlugin.initialResponseDataProcessed.insert(task.taskId)
+                })
+                // get suggested filename if needed
+                let (filename, uri) = unpack(packedString: task.filename)
+                if filename == "?" {
+                    if (uri == nil) {
+                        let newTask = taskWithSuggestedFilenameFromResponseHeaders(task: task, responseHeaders: response.allHeaderFields)
+                        if newTask.filename != task.filename {
+                            storeModifiedTask(task: newTask)
+                            task = newTask
+                        }
+                    } else {
+                        let suggestedFilename = suggestFilename(responseHeaders: response.allHeaderFields, urlString: task.url)
+                        let packed = pack(filename: suggestedFilename.isEmpty ? "unknown" : suggestedFilename, uri: uri!)
+                        let newTask = task.copyWith(filename: packed)
+                        storeModifiedTask(task: newTask)
+                        task = newTask
+                    }
+                }
+                extractContentType(responseHeaders: response.allHeaderFields, task: task)
+                // obtain content length override, if needed and available
+                if totalBytesExpectedToWrite == -1 {
+                    let contentLength = getContentLength(responseHeaders: response.allHeaderFields, task: task)
+                    if contentLength != -1 {
+                        BDPlugin.propertyLock.withLock({
+                            BDPlugin.tasksWithContentLengthOverride[task.taskId] = contentLength
+                        })
+                    }
+                }
+                // Check if there is enough space
+                if insufficientSpace(contentLength: totalBytesExpectedToWrite) {
+                    let notProgrammaticallyCancelled = BDPlugin.propertyLock.withLock({
+                        !BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.contains(task.taskId)
+                    })
+                    if notProgrammaticallyCancelled {
+                        os_log("Error for taskId %@: Insufficient space to store the file to be downloaded", log: log, type: .error, task.taskId)
+                        processStatusUpdate(task: task, status: .failed, taskException: TaskException(type: .fileSystem, httpResponseCode: -1, description: "Insufficient space to store the file to be downloaded for taskId \(task.taskId)"))
+                        BDPlugin.propertyLock.withLock({
+                            _ = BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.insert(task.taskId)
+                        })
+                        downloadTask.cancel()
+                    }
+                    return
+                }
+                // check if the task is resumable
+                if task.allowPause {
+                    let acceptRangesHeader = (downloadTask.response as? HTTPURLResponse)?.allHeaderFields["Accept-Ranges"]
+                    let taskCanResume = acceptRangesHeader as? String == "bytes"
+                    processCanResume(task: task, taskCanResume: taskCanResume)
+                    if taskCanResume {
+                        BDPlugin.propertyLock.withLock({
+                            _ = BDPlugin.taskIdsThatCanResume.insert(task.taskId)
+                        })
+                    }
+                }
             }
         }
         let contentLength = BDPlugin.propertyLock.withLock({
@@ -310,6 +317,7 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
             let charSet = BDPlugin.charSets.removeValue(forKey: taskId)
             BDPlugin.tasksWithModifications.removeValue(forKey: taskId)
             BDPlugin.tasksWithContentLengthOverride.removeValue(forKey: taskId)
+            BDPlugin.initialResponseDataProcessed.remove(taskId)
             return (mimeType, charSet)
         })
         let notificationConfig = getNotificationConfigFrom(urlSessionTask: downloadTask)
@@ -541,7 +549,7 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
     static func getAllTasks() async -> [Task] {
         UrlSessionDelegate.createUrlSession()
         guard let urlSessionTasks = await UrlSessionDelegate.urlSession?.allTasks else { return [] }
-        return urlSessionTasks.map({ getTaskFrom(urlSessionTask: $0) }).filter({ $0 != nil }) as? [Task] ?? []
+        return urlSessionTasks.compactMap({ getTaskFrom(urlSessionTask: $0) })
     }
     
     /// Return the active task with this taskId, or nil

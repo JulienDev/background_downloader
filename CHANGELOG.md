@@ -1,12 +1,59 @@
+## 9.4.0
+
+* Improves concurrency on mobile platforms by moving JSON encoding and decoding to an isolate, and introducing a job queue to ensure ordered message execution.
+* Adds `Config.skipExistingFiles` configuration option to skip the download if the destination file already exists (and conditionally does this only for files greater than a certain size)
+
+## 9.3.0
+
+Main change is in Android concurrency, triggered by the [Great Thread Merge](https://github.com/flutter/flutter/issues/150525) that causes UI blocking issues for recent versions of Flutter. The concurrency approach has been changed, but note this can cause minor changes in - for example - the sequence in which certain events happen.
+
+* Feature improvements
+  - Add pause and resume functionality to TaskQueue using `pauseAll` and `resumeAll`. These methods are now called when pausing or resuming all tasks using the `FileDownloader`
+
+* Bug fixes
+  - Fix issue with MultiUploadTask when uploading only one file
+  - UriUtils subclasses are now private, as they should have been to start with
+  - Address Dart analyzer recommendations
+
+## 9.2.6
+
+* Bug fix
+  - [Android] Fix Tap to open (on notification) bug, introduced in 9.2.4
+
+* Version upgrades
+  - [Android] compileSDK set to 36, targetSDK for example app set to 36, Kotlin compiler in example app set to 2.1.0
+
+## 9.2.5
+
+* Minor bug fixes
+  - [iOS] catch file write errors in multi-part uploads
+  - [iOS] fix optional unwrap error 
+
+## 9.2.4
+
+* Minor bug fixes
+  - [iOS] Notification update after killed app resumes
+  - [Android] Use of UTF-8 characters in `post` field
+  - Multipart upload remove extraneous CR/LF after header
+  - [Android] Fallback for expedited tasks when encountering OS error
+  - [Android] fix `enqueAll` and similar calls when no Activity attached
+
+## 9.2.3
+
+* Minor bug fixes
+  - [Android] Unmarking temp files as cache after move to download destination
+  - [iOS] Improved permissions bypassing
+  - [Android] Use of $ sign in notification substitutions
+  - [iOS] Crash on returning app to foreground when app is suspended
+
 ## 9.2.2
 * Adds option to set the `Content-Disposition` header for binary uploads
+* Fixes bug on iOS when using `openFile` with a filepath containing spaces
 
 For binary uploads, the `Content-Disposition` header will be:
 - set to 'attachment = "filename"' if the task.headers field does not contain an entry for 'Content-Disposition' (the prior default)
 - not set at all (i.e. omitted) if the task.headers field contains an entry for 'Content-Disposition' with the value '' (an empty string)
 - set to the value of `task.headers['Content-Disposition']` in all other cases
-
-* Fixes bug on iOS when using `openFile` with a filepath containing spaces
 
 ## 9.2.1
 * Minor bug fixes

@@ -1,7 +1,7 @@
 name: background_downloader
 description: A multi-platform background file downloader and uploader. Define the task, enqueue and monitor progress
 
-version: 9.2.2
+version: 9.4.0
 repository: https://github.com/781flyingdutchman/background_downloader
 
 environment:
@@ -22,7 +22,7 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: '>4.0.0 <6.0.0'
+  flutter_lints: '>4.0.0 <7.0.0'
   mockito: ^5.0.17
   build_runner: ^2.4.13
 
@@ -42,3 +42,6 @@ flutter:
         pluginClass: BDPlugin
       ios:
         pluginClass: BackgroundDownloaderPlugin
+
+funding:
+  - https://github.com/sponsors/781flyingdutchman

@@ -7,6 +7,7 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.edit
 import androidx.preference.PreferenceManager
 import androidx.work.Constraints
 import androidx.work.Data
@@ -15,6 +16,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
+import com.bbflight.background_downloader.BDPlugin.Companion.backgroundChannel
 import com.bbflight.background_downloader.TaskWorker.Companion.processStatusUpdate
 import com.bbflight.background_downloader.TaskWorker.Companion.taskToJsonString
 import io.flutter.embedding.engine.FlutterEngine
@@ -30,11 +32,10 @@ import io.flutter.plugin.common.PluginRegistry
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -47,8 +48,14 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
-import androidx.core.content.edit
+import androidx.work.OneTimeWorkRequest
 
+
+/**
+ * Custom exception for method call errors
+ */
+class MethodCallException(val errorCode: String, val errorMessage: String?, val errorDetails: Any?) :
+    Exception(errorMessage)
 
 /**
  * Entry-point for Android native side of the plugin
@@ -81,6 +88,8 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         const val keyConfigUseCacheDir = "com.bbflight.background_downloader.config.useCacheDir"
         const val keyConfigUseExternalStorage =
             "com.bbflight.background_downloader.config.useExternalStorage"
+        const val keyConfigSkipExistingFiles =
+            "com.bbflight.background_downloader.config.skipExistingFiles"
 
 
         @SuppressLint("StaticFieldLeak")
@@ -160,30 +169,35 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             val constraints = Constraints.Builder().setRequiredNetworkType(
                 if (taskRequiresWifi) NetworkType.UNMETERED else NetworkType.CONNECTED
             ).build()
-            val requestBuilder = when (task.taskType) {
-                "ParallelDownloadTask" -> OneTimeWorkRequestBuilder<ParallelDownloadTaskWorker>()
-                "DownloadTask" -> OneTimeWorkRequestBuilder<DownloadTaskWorker>()
-                "UriDownloadTask" -> OneTimeWorkRequestBuilder<DownloadTaskWorker>()
-                "UploadTask" -> OneTimeWorkRequestBuilder<UploadTaskWorker>()
-                "UriUploadTask" -> OneTimeWorkRequestBuilder<UploadTaskWorker>()
-                "MultiUploadTask" -> OneTimeWorkRequestBuilder<UploadTaskWorker>()
-                "DataTask" -> OneTimeWorkRequestBuilder<DataTaskWorker>()
-                else -> {
-                    Log.w(TAG, "Unknown taskType: ${task.taskType}")
-                    return false
-                }
-            }
-            requestBuilder.setInputData(data)
-                .setConstraints(constraints).addTag(TAG).addTag("taskId=${task.taskId}")
-                .addTag("group=${task.group}")
+            val requestBuilder: OneTimeWorkRequest.Builder =
+                createRequestBuilder(task, data, constraints) ?: return false
             if (initialDelayMillis != 0L) {
                 requestBuilder.setInitialDelay(initialDelayMillis, TimeUnit.MILLISECONDS)
             }
-            if (task.priority < 5 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val expedited = task.priority < 5 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+            if (expedited) {
                 requestBuilder.setExpedited(policy = OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             }
             val workManager = WorkManager.getInstance(context)
-            val operation = workManager.enqueue(requestBuilder.build())
+            val operation = try {
+                workManager.enqueue(requestBuilder.build())
+            } catch (e: IllegalStateException) {
+                if (expedited) {
+                    // known to happen on some devices, fallback to non-expedited
+                    Log.i(TAG, "Could not enqueue expedited task, falling back to non-expedited")
+                    val nonExpeditedRequestBuilder =
+                        createRequestBuilder(task, data, constraints) ?: return false
+                    if (initialDelayMillis != 0L) {
+                        nonExpeditedRequestBuilder.setInitialDelay(
+                            initialDelayMillis,
+                            TimeUnit.MILLISECONDS
+                        )
+                    }
+                    workManager.enqueue(nonExpeditedRequestBuilder.build())
+                } else {
+                    throw e
+                }
+            }
             try {
                 withContext(Dispatchers.IO) {
                     operation.result.get()
@@ -197,7 +211,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             } catch (_: Throwable) {
                 Log.w(
                     TAG,
-                    "Unable to start background request for taskId ${task.taskId} in operation: $operation"
+                    "Unable to start background request for taskId ${task.taskId}"
                 )
                 return false
             }
@@ -224,6 +238,35 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         /** True if task requires WiFi, based on global and task-specific settings */
         fun taskRequiresWifi(task: Task): Boolean {
             return (requireWifi == RequireWiFi.forAllTasks || (requireWifi == RequireWiFi.asSetByTask && task.requiresWiFi))
+        }
+
+        /**
+         * Create a [OneTimeWorkRequestBuilder] for the given [task], [data] and [constraints]
+         *
+         * Returns the builder, or null if the task type is unknown
+         */
+        private fun createRequestBuilder(
+            task: Task,
+            data: Data,
+            constraints: Constraints
+        ): OneTimeWorkRequest.Builder? {
+            val requestBuilder = when (task.taskType) {
+                "ParallelDownloadTask" -> OneTimeWorkRequestBuilder<ParallelDownloadTaskWorker>()
+                "DownloadTask" -> OneTimeWorkRequestBuilder<DownloadTaskWorker>()
+                "UriDownloadTask" -> OneTimeWorkRequestBuilder<DownloadTaskWorker>()
+                "UploadTask" -> OneTimeWorkRequestBuilder<UploadTaskWorker>()
+                "UriUploadTask" -> OneTimeWorkRequestBuilder<UploadTaskWorker>()
+                "MultiUploadTask" -> OneTimeWorkRequestBuilder<UploadTaskWorker>()
+                "DataTask" -> OneTimeWorkRequestBuilder<DataTaskWorker>()
+                else -> {
+                    Log.w(TAG, "Unknown taskType: ${task.taskType}")
+                    return null
+                }
+            }
+            requestBuilder.setInputData(data)
+                .setConstraints(constraints).addTag(TAG).addTag("taskId=${task.taskId}")
+                .addTag("group=${task.group}")
+            return requestBuilder
         }
 
         /** cancel tasks with [taskIds] and return true if successful */
@@ -363,7 +406,8 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     private var channel: MethodChannel? = null
     private var backgroundChannel: MethodChannel? = null
     private lateinit var applicationContext: Context
-    private var scope: CoroutineScope? = null
+    private lateinit var mainScope: CoroutineScope
+    private lateinit var ioScope: CoroutineScope
     private var binaryMessenger: BinaryMessenger? = null
     var activity: Activity? = null
 
@@ -373,6 +417,8 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      */
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         applicationContext = flutterPluginBinding.applicationContext
+        mainScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+        ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         binaryMessenger = flutterPluginBinding.binaryMessenger
         backgroundChannel =
             MethodChannel(
@@ -414,6 +460,8 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * BackgroundChannel is set to null, and references to it removed if it no longer in use anywhere
      * */
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        mainScope.cancel()
+        ioScope.cancel()
         channel?.setMethodCallHandler(null)
         channel = null
         bgChannelByTaskId =
@@ -427,57 +475,64 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
 
     /** Processes the methodCall coming from Dart */
     override fun onMethodCall(call: MethodCall, result: Result) {
-        runBlocking {
-            when (call.method) {
-                "enqueue" -> methodEnqueue(call, result)
-                "enqueueAll" -> methodEnqueueAll(call, result)
-                "reset" -> methodReset(call, result)
-                "allTasks" -> methodAllTasks(call, result)
-                "cancelTasksWithIds" -> methodCancelTasksWithIds(call, result)
-                "killTaskWithId" -> methodKillTaskWithId(call, result)
-                "taskForId" -> methodTaskForId(call, result)
-                "pause" -> methodPause(call, result)
-                "pauseAll" -> methodPauseAll(call, result)
-                "updateNotification" -> methodUpdateNotification(call, result)
-                "moveToSharedStorage" -> methodMoveToSharedStorage(call, result)
-                "pathInSharedStorage" -> methodPathInSharedStorage(call, result)
-                "openFile" -> methodOpenFile(call, result)
-                "requireWiFi" -> methodRequireWiFi(call, result)
-                "getRequireWiFiSetting" -> methodGetRequireWiFiSetting(result)
-                // ParallelDownloadTask child updates
-                "chunkStatusUpdate" -> methodUpdateChunkStatus(call, result)
-                "chunkProgressUpdate" -> methodUpdateChunkProgress(call, result)
-                // Permissions
-                "permissionStatus" -> methodPermissionStatus(call, result)
-                "requestPermission" -> methodRequestPermission(call, result)
-                "shouldShowPermissionRationale" -> methodShouldShowPermissionRationale(call, result)
-                // internal use
-                "popResumeData" -> methodPopResumeData(result)
-                "popStatusUpdates" -> methodPopStatusUpdates(result)
-                "popProgressUpdates" -> methodPopProgressUpdates(result)
-                "getTaskTimeout" -> methodGetTaskTimeout(result)
-                "registerCallbackDispatcher" -> methodRegisterCallbackDispatcher(call, result)
-                // configuration
-                "configForegroundFileSize" -> methodConfigForegroundFileSize(call, result)
-                "configProxyAddress" -> methodConfigProxyAddress(call, result)
-                "configProxyPort" -> methodConfigProxyPort(call, result)
-                "configRequestTimeout" -> methodConfigRequestTimeout(call, result)
-                "configBypassTLSCertificateValidation" -> methodConfigBypassTLSCertificateValidation(
-                    result
-                )
+        mainScope.launch {
+            try {
+                val res: Any? = when (call.method) {
+                    "enqueue" -> methodEnqueue(call)
+                    "enqueueAll" -> methodEnqueueAll(call)
+                    "reset" -> methodReset(call)
+                    "allTasks" -> methodAllTasks(call)
+                    "cancelTasksWithIds" -> methodCancelTasksWithIds(call)
+                    "killTaskWithId" -> methodKillTaskWithId(call)
+                    "taskForId" -> methodTaskForId(call)
+                    "pause" -> methodPause(call)
+                    "pauseAll" -> methodPauseAll(call)
+                    "updateNotification" -> methodUpdateNotification(call)
+                    "moveToSharedStorage" -> methodMoveToSharedStorage(call)
+                    "pathInSharedStorage" -> methodPathInSharedStorage(call)
+                    "openFile" -> methodOpenFile(call)
+                    "requireWiFi" -> methodRequireWiFi(call)
+                    "getRequireWiFiSetting" -> methodGetRequireWiFiSetting()
+                    // ParallelDownloadTask child updates
+                    "chunkStatusUpdate" -> methodUpdateChunkStatus(call)
+                    "chunkProgressUpdate" -> methodUpdateChunkProgress(call)
+                    // Permissions
+                    "permissionStatus" -> methodPermissionStatus(call)
+                    "requestPermission" -> methodRequestPermission(call)
+                    "shouldShowPermissionRationale" -> methodShouldShowPermissionRationale(call)
+                    // internal use
+                    "popResumeData" -> methodPopResumeData()
+                    "popStatusUpdates" -> methodPopStatusUpdates()
+                    "popProgressUpdates" -> methodPopProgressUpdates()
+                    "getTaskTimeout" -> methodGetTaskTimeout()
+                    "registerCallbackDispatcher" -> methodRegisterCallbackDispatcher(call)
+                    // configuration
+                    "configForegroundFileSize" -> methodConfigForegroundFileSize(call)
+                    "configProxyAddress" -> methodConfigProxyAddress(call)
+                    "configProxyPort" -> methodConfigProxyPort(call)
+                    "configRequestTimeout" -> methodConfigRequestTimeout(call)
+                    "configBypassTLSCertificateValidation" -> methodConfigBypassTLSCertificateValidation()
+                    "configCheckAvailableSpace" -> methodConfigCheckAvailableSpace(call)
+                    "configUseCacheDir" -> methodConfigUseCacheDir(call)
+                    "configUseExternalStorage" -> methodConfigUseExternalStorage(call)
+                    "configHoldingQueue" -> methodConfigHoldingQueue(call)
+                    "configSkipExistingFiles" -> methodConfigSkipExistingFiles(call)
+                    "platformVersion" -> methodPlatformVersion()
+                    "forceFailPostOnBackgroundChannel" -> methodForceFailPostOnBackgroundChannel(
+                        call
+                    )
 
-                "configCheckAvailableSpace" -> methodConfigCheckAvailableSpace(call, result)
-                "configUseCacheDir" -> methodConfigUseCacheDir(call, result)
-                "configUseExternalStorage" -> methodConfigUseExternalStorage(call, result)
-                "configHoldingQueue" -> methodConfigHoldingQueue(call, result)
-                "platformVersion" -> methodPlatformVersion(result)
-                "forceFailPostOnBackgroundChannel" -> methodForceFailPostOnBackgroundChannel(
-                    call, result
-                )
+                    "testSuggestedFilename" -> methodTestSuggestedFilename(call)
 
-                "testSuggestedFilename" -> methodTestSuggestedFilename(call, result)
-
-                else -> result.notImplemented()
+                    else -> throw MethodCallException(
+                        "notImplemented",
+                        "Method ${call.method} not implemented",
+                        null
+                    )
+                }
+                result.success(res)
+            } catch (e: MethodCallException) {
+                result.error(e.errorCode, e.errorMessage, e.errorDetails)
             }
         }
     }
@@ -488,80 +543,71 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * Returns true if successful, and will emit a status update that the task is running.
      */
-    private suspend fun methodEnqueue(call: MethodCall, result: Result) {
-        // Arguments are a list of Task, NotificationConfig?, optionally followed
-        // by tempFilePath, startByte and eTag if this enqueue is a resume from pause
-        val args = call.arguments as List<*>
-        val taskJsonMapString = args[0] as String
-        val task = Json.decodeFromString<Task>(taskJsonMapString)
-        val notificationConfigJsonString = args[1] as String?
-        val isResume = args.size == 5
-        val resumeData: ResumeData? = if (isResume) {
-            val startByte = if (args[3] is Long) args[3] as Long else (args[3] as Int).toLong()
-            val eTag = args[4] as String?
-            ResumeData(task, args[2] as String, startByte, eTag)
-        } else {
-            null
-        }
-        // validate the task.url
-        try {
-            URL(task.url)
-            withContext(Dispatchers.IO) {
-                URLDecoder.decode(task.url, "UTF-8")
+    private suspend fun methodEnqueue(call: MethodCall): Boolean =
+        withContext(ioScope.coroutineContext) {
+            // Arguments are a list of Task, NotificationConfig?, optionally followed
+            // by tempFilePath, startByte and eTag if this enqueue is a resume from pause
+            val args = call.arguments as List<*>
+            val taskJsonMapString = args[0] as String
+            val task = Json.decodeFromString<Task>(taskJsonMapString)
+            val notificationConfigJsonString = args[1] as String?
+            val isResume = args.size == 5
+            val resumeData: ResumeData? = if (isResume) {
+                val startByte = if (args[3] is Long) args[3] as Long else (args[3] as Int).toLong()
+                val eTag = args[4] as String?
+                ResumeData(task, args[2] as String, startByte, eTag)
+            } else {
+                null
             }
-        } catch (_: MalformedURLException) {
-            Log.i(TAG, "MalformedURLException for taskId ${task.taskId}")
-            result.success(false)
-            return
-        } catch (_: IllegalArgumentException) {
-            Log.i(TAG, "Could not url-decode url for taskId ${task.taskId}")
-            result.success(false)
-            return
-        }
-        // enqueue or add to HoldingQueue
-        if (holdingQueue == null) {
-            result.success(
+            // validate the task.url
+            try {
+                URL(task.url)
+                URLDecoder.decode(task.url, "UTF-8")
+            } catch (_: MalformedURLException) {
+                Log.i(TAG, "MalformedURLException for taskId ${task.taskId}")
+                return@withContext false
+            } catch (_: IllegalArgumentException) {
+                Log.i(TAG, "Could not url-decode url for taskId ${task.taskId}")
+                return@withContext false
+            }
+            // enqueue or add to HoldingQueue
+            if (holdingQueue == null) {
                 doEnqueue(
                     applicationContext,
                     task,
                     notificationConfigJsonString,
                     resumeData,
-                    plugin = this
+                    plugin = this@BDPlugin
                 )
-            )
-        } else {
-            Log.i(TAG, "Enqueueing task with id ${task.taskId} to the HoldingQueue")
-            holdingQueue?.add(
-                EnqueueItem(
-                    context = applicationContext,
-                    task = task,
-                    notificationConfigJsonString = notificationConfigJsonString,
-                    resumeData = resumeData,
-                    plugin = this
+            } else {
+                Log.i(TAG, "Enqueueing task with id ${task.taskId} to the HoldingQueue")
+                holdingQueue?.add(
+                    EnqueueItem(
+                        context = applicationContext,
+                        task = task,
+                        notificationConfigJsonString = notificationConfigJsonString,
+                        resumeData = resumeData,
+                        plugin = this@BDPlugin
+                    )
                 )
-            )
-            processStatusUpdate(
-                task,
-                TaskStatus.enqueued,
-                PreferenceManager.getDefaultSharedPreferences(applicationContext),
-                context = applicationContext
-            )
-            result.success(true)
+                processStatusUpdate(
+                    task,
+                    TaskStatus.enqueued,
+                    PreferenceManager.getDefaultSharedPreferences(applicationContext),
+                    context = applicationContext
+                )
+                true
+            }
         }
-    }
 
     /**
      * Starts a list of tasks, passed as a JSON string representing a list of [Task] objects.
      *
      * Returns a list of booleans indicating the success of each individual enqueue operation.
      */
-    private fun methodEnqueueAll(call: MethodCall, result: Result) {
-        if (scope == null) {
-            result.success(emptyList<Boolean>())
-            return
-        }
-        val plugin = this
-        scope!!.launch(Dispatchers.IO) {
+    private suspend fun methodEnqueueAll(call: MethodCall): List<Boolean> =
+        withContext(ioScope.coroutineContext) {
+            val plugin = this@BDPlugin
             val args = call.arguments as List<*>
             val taskListJsonString = args[0] as String
             val notificationConfigListJsonString = args[1] as String
@@ -583,51 +629,50 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                             URLDecoder.decode(task.url, "UTF-8")
                         } catch (_: MalformedURLException) {
                             Log.i(TAG, "MalformedURLException for taskId ${task.taskId}")
-                            results.add(false)
-                            continue
-                        } catch (_: IllegalArgumentException) {
-                            Log.i(TAG, "Could not url-decode url for taskId ${task.taskId}")
-                            results.add(false)
-                            continue
-                        }
-                        // Enqueue or add to HoldingQueue
-                        success = if (holdingQueue == null) {
-                            doEnqueue(
-                                applicationContext,
-                                task,
-                                notificationConfigJsonString,
+                        results.add(false)
+                        continue
+                    } catch (_: IllegalArgumentException) {
+                        Log.i(TAG, "Could not url-decode url for taskId ${task.taskId}")
+                        results.add(false)
+                        continue
+                    }
+                    // Enqueue or add to HoldingQueue
+                    success = if (holdingQueue == null) {
+                        doEnqueue(
+                            applicationContext,
+                            task,
+                            notificationConfigJsonString,
+                            resumeData = null,
+                            plugin = plugin
+                        )
+                    } else {
+                        Log.i(TAG, "Enqueueing task with id ${task.taskId} to the HoldingQueue")
+                        holdingQueue?.add(
+                            EnqueueItem(
+                                context = applicationContext,
+                                task = task,
+                                notificationConfigJsonString = notificationConfigJsonString,
                                 resumeData = null,
                                 plugin = plugin
                             )
-                        } else {
-                            Log.i(TAG, "Enqueueing task with id ${task.taskId} to the HoldingQueue")
-                            holdingQueue?.add(
-                                EnqueueItem(
-                                    context = applicationContext,
-                                    task = task,
-                                    notificationConfigJsonString = notificationConfigJsonString,
-                                    resumeData = null,
-                                    plugin = plugin
-                                )
-                            )
-                            processStatusUpdate(
-                                task,
-                                TaskStatus.enqueued,
-                                PreferenceManager.getDefaultSharedPreferences(applicationContext),
-                                context = applicationContext
-                            )
-                            true
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error processing task ${task.taskId}: ${e.message}")
+                        )
+                        processStatusUpdate(
+                            task,
+                            TaskStatus.enqueued,
+                            PreferenceManager.getDefaultSharedPreferences(applicationContext),
+                            context = applicationContext
+                        )
+                        true
                     }
-                    results.add(success)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error processing task ${task.taskId}: ${e.message}")
                 }
-                result.success(results)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error decoding JSON: ${e.message}")
-                result.success(emptyList<Boolean>()) // Return an empty list on error
+                results.add(success)
             }
+            results
+        } catch (e: Exception) {
+            Log.e(TAG, "Error decoding JSON: ${e.message}")
+            emptyList() // Return an empty list on error
         }
     }
 
@@ -636,7 +681,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * Returns the number of tasks canceled
      */
-    private suspend fun methodReset(call: MethodCall, result: Result) {
+    private suspend fun methodReset(call: MethodCall): Int = withContext(ioScope.coroutineContext) {
         val group = call.arguments as String
         holdingQueue?.stateMutex?.lock()
         var counter = holdingQueue?.cancelAllTasks(applicationContext, group) ?: 0
@@ -646,9 +691,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             tasksMap = getTaskMap(prefs)
         }
         val workManager = WorkManager.getInstance(applicationContext)
-        val workInfos = withContext(Dispatchers.IO) {
-            workManager.getWorkInfosByTag(TAG).get()
-        }
+        val workInfos = workManager.getWorkInfosByTag(TAG).get()
             .filter { !it.state.isFinished && it.tags.contains("group=$group") }
         for (workInfo in workInfos) {
             val tags = workInfo.tags.filter { it.contains("taskId=") }
@@ -671,61 +714,56 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
         }
         holdingQueue?.stateMutex?.unlock()
         Log.v(TAG, "methodReset removed $counter unfinished tasks in group $group")
-        result.success(counter)
+        counter
     }
 
     /**
      * Returns a list of tasks for all tasks in progress, as a list of JSON strings,
      * optionally filtered by group
      */
-    private suspend fun methodAllTasks(call: MethodCall, result: Result) {
-        val group = call.arguments as String?
-        val tasksAsListOfJsonStrings = mutableListOf<String>()
-        holdingQueue?.stateMutex?.lock()
-        holdingQueue?.allTasks(group)
-            ?.forEach { tasksAsListOfJsonStrings.add(Json.encodeToString(it)) }
-        val workManager = WorkManager.getInstance(applicationContext)
-        val workInfos = withContext(Dispatchers.IO) {
-            workManager.getWorkInfosByTag(TAG).get()
-        }
-            .filter { !it.state.isFinished && (group == null || it.tags.contains("group=$group")) }
-        val tasksMap: MutableMap<String, Task>
-        val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
-        prefsLock.read {
-            tasksMap = getTaskMap(prefs)
-        }
-        for (workInfo in workInfos) {
-            val tags = workInfo.tags.filter { it.contains("taskId=") }
-            if (tags.isNotEmpty()) {
-                val taskId = tags.first().substring(7)
-                val task = tasksMap[taskId]
-                if (task != null) {
-                    tasksAsListOfJsonStrings.add(Json.encodeToString(task))
+    private suspend fun methodAllTasks(call: MethodCall): List<String> =
+        withContext(ioScope.coroutineContext) {
+            val group = call.arguments as String?
+            val tasksAsListOfJsonStrings = mutableListOf<String>()
+            holdingQueue?.stateMutex?.lock()
+            holdingQueue?.allTasks(group)
+                ?.forEach { tasksAsListOfJsonStrings.add(Json.encodeToString(it)) }
+            val workManager = WorkManager.getInstance(applicationContext)
+            val workInfos = workManager.getWorkInfosByTag(TAG).get()
+                .filter { !it.state.isFinished && (group == null || it.tags.contains("group=$group")) }
+            val tasksMap: MutableMap<String, Task>
+            val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+            prefsLock.read {
+                tasksMap = getTaskMap(prefs)
+            }
+            for (workInfo in workInfos) {
+                val tags = workInfo.tags.filter { it.contains("taskId=") }
+                if (tags.isNotEmpty()) {
+                    val taskId = tags.first().substring(7)
+                    val task = tasksMap[taskId]
+                    if (task != null) {
+                        tasksAsListOfJsonStrings.add(Json.encodeToString(task))
+                    }
                 }
             }
+            holdingQueue?.stateMutex?.unlock()
+            Log.v(
+                TAG,
+                "Returning ${tasksAsListOfJsonStrings.size} unfinished tasks in group $group"
+            )
+            tasksAsListOfJsonStrings
         }
-        holdingQueue?.stateMutex?.unlock()
-        Log.v(TAG, "Returning ${tasksAsListOfJsonStrings.size} unfinished tasks in group $group")
-        result.success(tasksAsListOfJsonStrings)
-    }
 
     /**
      * Cancels ongoing tasks whose taskId is in the list provided with this call
      *
      * Returns true if all cancellations were successful
      */
-    private fun methodCancelTasksWithIds(call: MethodCall, result: Result) {
-        if (scope == null) {
-            result.success(false) // Or handle the error appropriately
-            return
-        }
-        scope!!.launch(Dispatchers.IO) {
+    private suspend fun methodCancelTasksWithIds(call: MethodCall): Boolean =
+        withContext(ioScope.coroutineContext) {
             @Suppress("UNCHECKED_CAST") val taskIds = call.arguments as List<String>
-            withContext(Dispatchers.Main) {
-                result.success(cancelTasksWithIds(applicationContext, taskIds))
-            }
+            cancelTasksWithIds(applicationContext, taskIds)
         }
-    }
 
     /**
      * Kills task with taskId provided as argument in call
@@ -738,68 +776,67 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * whenever a task emits a 'failed' update, as we have no way to determine if the task failed
      * with the worker 'SUCCESS' or with the worker 'CANCELED'
      */
-    private fun methodKillTaskWithId(call: MethodCall, result: Result) {
+    private suspend fun methodKillTaskWithId(call: MethodCall): Any? {
         val taskId = call.arguments as String
-        val workManager = WorkManager.getInstance(applicationContext)
-        val operation = workManager.cancelAllWorkByTag("taskId=$taskId")
-        try {
-            operation.result.get()
-        } catch (_: Throwable) {
-            Log.w(
-                TAG,
-                "Could not kill task wih id $taskId in operation: $operation"
-            )
+        withContext(ioScope.coroutineContext) {
+            val workManager = WorkManager.getInstance(applicationContext)
+            val operation = workManager.cancelAllWorkByTag("taskId=$taskId")
+            try {
+                operation.result.get()
+            } catch (_: Throwable) {
+                Log.w(
+                    TAG,
+                    "Could not kill task wih id $taskId in operation: $operation"
+                )
+            }
         }
-        result.success(null)
+        return null
     }
 
     /** Returns Task for this taskId, or nil */
-    private suspend fun methodTaskForId(call: MethodCall, result: Result) {
-        val taskId = call.arguments as String
-        Log.v(TAG, "Returning task for taskId $taskId")
-        holdingQueue?.stateMutex?.lock()
-        var foundTask = holdingQueue?.taskForId(taskId)
-        if (foundTask == null) {
-            prefsLock.read {
-                val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
-                val tasksMap = getTaskMap(prefs)
-                foundTask = tasksMap[taskId]
+    private suspend fun methodTaskForId(call: MethodCall): String? =
+        withContext(ioScope.coroutineContext) {
+            val taskId = call.arguments as String
+            Log.v(TAG, "Returning task for taskId $taskId")
+            holdingQueue?.stateMutex?.lock()
+            var foundTask = holdingQueue?.taskForId(taskId)
+            if (foundTask == null) {
+                prefsLock.read {
+                    val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
+                    val tasksMap = getTaskMap(prefs)
+                    foundTask = tasksMap[taskId]
+                }
             }
+            holdingQueue?.stateMutex?.unlock()
+            foundTask?.let { Json.encodeToString(it) }
         }
-        if (foundTask != null) {
-            result.success(Json.encodeToString(foundTask))
-        } else {
-            result.success(null)
-        }
-        holdingQueue?.stateMutex?.unlock()
-    }
 
     /**
      * Marks the taskId for pausing
      *
      * The pause action is taken in the [TaskWorker]
      */
-    private fun methodPause(call: MethodCall, result: Result) {
+    private fun methodPause(call: MethodCall): Boolean {
         val taskId = call.arguments as String
-        result.success(pauseTaskWithId(taskId))
+        return pauseTaskWithId(taskId)
     }
 
     /**
      * Marks all taskIds for pausing
      */
-    private fun methodPauseAll(call: MethodCall, result: Result) {
-        val taskIds = call.arguments as? List<*> ?: run {
-            result.error("INVALID_ARGUMENT", "Expected a list of task IDs", null)
-            return
-        }
-        val results = taskIds.map { taskId ->
+    private fun methodPauseAll(call: MethodCall): List<Boolean> {
+        val taskIds = call.arguments as? List<*> ?: throw MethodCallException(
+            "INVALID_ARGUMENT",
+            "Expected a list of task IDs",
+            null
+        )
+        return taskIds.map { taskId ->
             if (taskId is String) {
                 pauseTaskWithId(taskId)
             } else {
                 false
             }
         }
-        result.success(results)
     }
 
     /**
@@ -810,19 +847,20 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * - notificationConfig (cannot be null)
      * - taskStatus as ordinal in TaskStatus enum. If null, delete the notification
      */
-    private fun methodUpdateNotification(call: MethodCall, result: Result) {
-        val args = call.arguments as List<*>
-        val taskJsonMapString = args[0] as String
-        val notificationConfigJsonString = args[1] as String
-        val taskStatusOrdinal = args[2] as Int?
-        NotificationService.createUpdateNotificationWorker(
-            applicationContext,
-            taskJsonMapString,
-            notificationConfigJsonString,
-            taskStatusOrdinal
-        )
-        result.success(null)
-    }
+    private suspend fun methodUpdateNotification(call: MethodCall): Any? =
+        withContext(ioScope.coroutineContext) {
+            val args = call.arguments as List<*>
+            val taskJsonMapString = args[0] as String
+            val notificationConfigJsonString = args[1] as String
+            val taskStatusOrdinal = args[2] as Int?
+            NotificationService.createUpdateNotificationWorker(
+                applicationContext,
+                taskJsonMapString,
+                notificationConfigJsonString,
+                taskStatusOrdinal
+            )
+            null
+        }
 
 
     /**
@@ -830,11 +868,10 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * in local shared preferences because they could not be delivered to the Dart side.
      * Local storage of this map is then cleared
      */
-    private fun methodPopResumeData(result: Result) {
-        popLocalStorage(
-            keyResumeDataMap,
-            result
-        )
+    private suspend fun methodPopResumeData(): String {
+        return withContext(ioScope.coroutineContext) {
+            popLocalStorage(keyResumeDataMap)
+        }
     }
 
     /**
@@ -842,8 +879,10 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * in local shared preferences because they could not be delivered to the Dart side.
      * Local storage of this map is then cleared
      */
-    private fun methodPopStatusUpdates(result: Result) {
-        popLocalStorage(keyStatusUpdateMap, result)
+    private suspend fun methodPopStatusUpdates(): String {
+        return withContext(ioScope.coroutineContext) {
+            popLocalStorage(keyStatusUpdateMap)
+        }
     }
 
     /**
@@ -851,24 +890,26 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * in local shared preferences because they could not be delivered to the Dart side.
      * Local storage of this map is then cleared
      */
-    private fun methodPopProgressUpdates(result: Result) {
-        popLocalStorage(keyProgressUpdateMap, result)
+    private suspend fun methodPopProgressUpdates(): String {
+        return withContext(ioScope.coroutineContext) {
+            popLocalStorage(keyProgressUpdateMap)
+        }
     }
 
     /**
-     * Pops and returns locally stored data for this key as a JSON String, via the FlutterResult
+     * Pops and returns locally stored data for this key as a JSON String
      *
      * The Json string represents a Map, keyed by TaskId, where each item is a Json representation
      * of the object stored, e.g. a [TaskStatusUpdate]
      */
-    private fun popLocalStorage(prefsKey: String, result: Result) {
-        prefsLock.write {
+    private fun popLocalStorage(prefsKey: String): String {
+        return prefsLock.write {
             val prefs = PreferenceManager.getDefaultSharedPreferences(applicationContext)
             val jsonString = prefs.getString(prefsKey, "{}")
             prefs.edit {
                 remove(prefsKey)
             }
-            result.success(jsonString)
+            jsonString ?: "{}"
         }
     }
 
@@ -882,20 +923,20 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * - mimeType (String?): mimeType of the file, overrides derived mimeType
      * - asUriString (Boolean): if set, returns the path not as a filePath but as a Uri
      */
-    private suspend fun methodMoveToSharedStorage(call: MethodCall, result: Result) {
-        val args = call.arguments as List<*>
-        val filePath = args[0] as String
-        val destination = SharedStorage.entries[args[1] as Int]
-        val directory = args[2] as String
-        val mimeType = args[3] as String?
-        val asUriString = args[4] as Boolean
-        // first check and potentially ask for permissions
-        val status = PermissionsService.getPermissionStatus(
-            applicationContext,
-            PermissionType.androidSharedStorage
-        )
-        if (status == PermissionStatus.granted) {
-            result.success(
+    private suspend fun methodMoveToSharedStorage(call: MethodCall): String? =
+        withContext(ioScope.coroutineContext) {
+            val args = call.arguments as List<*>
+            val filePath = args[0] as String
+            val destination = SharedStorage.entries[args[1] as Int]
+            val directory = args[2] as String
+            val mimeType = args[3] as String?
+            val asUriString = args[4] as Boolean
+            // first check and potentially ask for permissions
+            val status = PermissionsService.getPermissionStatus(
+                applicationContext,
+                PermissionType.androidSharedStorage
+            )
+            if (status == PermissionStatus.granted) {
                 moveToSharedStorage(
                     applicationContext,
                     filePath,
@@ -904,12 +945,11 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     mimeType,
                     asUriString
                 )
-            )
-        } else {
-            Log.i(TAG, "No permission to move to shared storage")
-            result.success(null)
+            } else {
+                Log.i(TAG, "No permission to move to shared storage")
+                null
+            }
         }
-    }
 
     /**
      * Returns path to file in Android scoped/shared storage, or null
@@ -925,13 +965,13 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * For Android Q+ uses the MediaStore, matching on filename only, i.e. ignoring
      * the directory
      */
-    private fun methodPathInSharedStorage(call: MethodCall, result: Result) {
+    private suspend fun methodPathInSharedStorage(call: MethodCall): String? {
         val args = call.arguments as List<*>
         val filePath = args[0] as String
         val destination = SharedStorage.entries[args[1] as Int]
         val directory = args[2] as String
         val asUriString = args[3] as Boolean
-        result.success(
+        return withContext(ioScope.coroutineContext) {
             pathInSharedStorage(
                 applicationContext,
                 filePath,
@@ -939,7 +979,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 directory,
                 asUriString
             )
-        )
+        }
     }
 
     /**
@@ -948,14 +988,14 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * Call arguments are [taskJsonMapString, filename, mimeType] with precondition that either
      * task or filename is not null
      */
-    private fun methodOpenFile(call: MethodCall, result: Result) {
+    private fun methodOpenFile(call: MethodCall): Boolean {
         val args = call.arguments as List<*>
         val taskJsonMapString = args[0] as String?
         val task =
             if (taskJsonMapString != null) Json.decodeFromString<Task>(taskJsonMapString) else null
         val filePath = args[1] as String? ?: task!!.filePath(applicationContext)
         val mimeType = args[2] as String? ?: getMimeType(filePath)
-        result.success(if (activity != null) doOpenFile(activity!!, filePath, mimeType) else false)
+        return if (activity != null) doOpenFile(activity!!, filePath, mimeType) else false
     }
 
     /**
@@ -971,7 +1011,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * Returns true always
      */
-    private suspend fun methodRequireWiFi(call: MethodCall, result: Result) {
+    private suspend fun methodRequireWiFi(call: MethodCall): Boolean = withContext(ioScope.coroutineContext) {
         val args = call.arguments as List<*>
         val newRequireWiFi = RequireWiFi.entries[args[0] as Int]
         val rescheduleRunning = args[1] as Boolean
@@ -982,17 +1022,18 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                 rescheduleRunning
             )
         )
-        result.success(true)
+        true
     }
 
     /**
      * Returns the current global setting for 'requireWiFi', as an ordinal
      */
-    private fun methodGetRequireWiFiSetting(result: Result) {
-        val setting = PreferenceManager.getDefaultSharedPreferences(applicationContext).getInt(
-            keyRequireWiFi, 0
-        )
-        result.success(setting)
+    private suspend fun methodGetRequireWiFiSetting(): Int {
+        return withContext(ioScope.coroutineContext) {
+            PreferenceManager.getDefaultSharedPreferences(applicationContext).getInt(
+                keyRequireWiFi, 0
+            )
+        }
     }
 
     /**
@@ -1002,7 +1043,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * Arguments are the parent TaskId, chunk taskId, taskStatusOrdinal
      */
-    private suspend fun methodUpdateChunkStatus(call: MethodCall, result: Result) {
+    private suspend fun methodUpdateChunkStatus(call: MethodCall): Any? = withContext(ioScope.coroutineContext) {
         val args = call.arguments as List<*>
         val taskId = args[0] as String
         val chunkTaskId = args[1] as String
@@ -1024,7 +1065,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             Log.w(TAG, "exceptionJson = $exceptionJson")
             e.printStackTrace()
         }
-        result.success(null)
+        null
     }
 
     /**
@@ -1033,7 +1074,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * Arguments are the parent [TaskId, chunk taskId, progress]
      */
-    private suspend fun methodUpdateChunkProgress(call: MethodCall, result: Result) {
+    private suspend fun methodUpdateChunkProgress(call: MethodCall): Any? = withContext(ioScope.coroutineContext) {
         val args = call.arguments as List<*>
         val taskId = args[0] as String
         val chunkTaskId = args[1] as String
@@ -1042,20 +1083,18 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             chunkTaskId,
             progress
         )
-        result.success(null)
+        null
     }
 
     /**
      * Return [PermissionStatus] for this [PermissionType]
      */
-    private fun methodPermissionStatus(call: MethodCall, result: Result) {
+    private fun methodPermissionStatus(call: MethodCall): Int {
         val permissionType = PermissionType.entries[call.arguments as Int]
-        result.success(
-            PermissionsService.getPermissionStatus(
-                applicationContext,
-                permissionType
-            ).ordinal
-        )
+        return PermissionsService.getPermissionStatus(
+            applicationContext,
+            permissionType
+        ).ordinal
     }
 
     /**
@@ -1065,21 +1104,19 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * Flutter side should wait for completion via the background
      * channel method "permissionRequestResult"
      */
-    private fun methodRequestPermission(call: MethodCall, result: Result) {
+    private fun methodRequestPermission(call: MethodCall): Boolean {
         val permissionType = PermissionType.entries[call.arguments as Int]
-        result.success(PermissionsService.requestPermission(this, permissionType))
+        return PermissionsService.requestPermission(this, permissionType)
     }
 
     /**
      * Returns true if you should show a rationale for this [PermissionType]
      */
-    private fun methodShouldShowPermissionRationale(call: MethodCall, result: Result) {
+    private fun methodShouldShowPermissionRationale(call: MethodCall): Boolean {
         val permissionType = PermissionType.entries[call.arguments as Int]
-        result.success(
-            PermissionsService.shouldShowRequestPermissionRationale(
-                this,
-                permissionType
-            )
+        return PermissionsService.shouldShowRequestPermissionRationale(
+            this,
+            permissionType
         )
     }
 
@@ -1088,8 +1125,8 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * For testing only
      */
-    private fun methodGetTaskTimeout(result: Result) {
-        result.success(TaskWorker.taskTimeoutMillis)
+    private fun methodGetTaskTimeout(): Long {
+        return TaskWorker.taskTimeoutMillis
     }
 
     /**
@@ -1098,18 +1135,20 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * Dispatcher is called just before passing callback via methodChannel, to ensure
      * that Dart is listening to the methodChannel before calling the callback.
      */
-    private fun methodRegisterCallbackDispatcher(call: MethodCall, result: Result) {
-        PreferenceManager.getDefaultSharedPreferences(applicationContext).edit().apply {
-            val handle = call.arguments as Long?
-            if (handle != null) {
-                Log.d(TAG, "Registering callbackDispatcher handle $handle")
-                putLong(keyCallbackDispatcherRawHandle, handle)
-            } else {
-                remove(keyConfigProxyAddress)
+    private suspend fun methodRegisterCallbackDispatcher(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            PreferenceManager.getDefaultSharedPreferences(applicationContext).edit().apply {
+                val handle = call.arguments as Long?
+                if (handle != null) {
+                    Log.d(TAG, "Registering callbackDispatcher handle $handle")
+                    putLong(keyCallbackDispatcherRawHandle, handle)
+                } else {
+                    remove(keyConfigProxyAddress)
+                }
+                apply()
             }
-            apply()
         }
-        result.success(null)
+        return null
     }
 
 
@@ -1119,87 +1158,103 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * The value is in MB, or -1 to disable foreground always, and
      * is retrieved in [TaskWorker.doWork]
      */
-    private fun methodConfigForegroundFileSize(call: MethodCall, result: Result) {
-        val fileSize = call.arguments as Int
-        updateSharedPreferences(keyConfigForegroundFileSize, fileSize)
-        val msg = when (fileSize) {
-            0 -> "Enabled foreground mode for all tasks"
-            -1 -> "Disabled foreground mode for all tasks"
-            else -> "Set foreground file size threshold to $fileSize MB"
+    private suspend fun methodConfigForegroundFileSize(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            val fileSize = call.arguments as Int
+            updateSharedPreferences(keyConfigForegroundFileSize, fileSize)
+            val msg = when (fileSize) {
+                0 -> "Enabled foreground mode for all tasks"
+                -1 -> "Disabled foreground mode for all tasks"
+                else -> "Set foreground file size threshold to $fileSize MB"
+            }
+            Log.v(TAG, msg)
         }
-        Log.v(TAG, msg)
-        result.success(null)
+        return null
     }
 
     /**
      * Store the proxy address config in shared preferences
      */
-    private fun methodConfigProxyAddress(call: MethodCall, result: Result) {
-        PreferenceManager.getDefaultSharedPreferences(applicationContext).edit().apply {
-            val address = call.arguments as String?
-            if (address != null) {
-                putString(keyConfigProxyAddress, address)
-            } else {
-                remove(keyConfigProxyAddress)
+    private suspend fun methodConfigProxyAddress(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            PreferenceManager.getDefaultSharedPreferences(applicationContext).edit().apply {
+                val address = call.arguments as String?
+                if (address != null) {
+                    putString(keyConfigProxyAddress, address)
+                } else {
+                    remove(keyConfigProxyAddress)
+                }
+                apply()
             }
-            apply()
         }
-        result.success(null)
+        return null
     }
 
     /**
      * Store the proxy port config in shared preferences
      */
-    private fun methodConfigProxyPort(call: MethodCall, result: Result) {
-        updateSharedPreferences(keyConfigProxyPort, call.arguments as Int?)
-        result.success(null)
+    private suspend fun methodConfigProxyPort(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            updateSharedPreferences(keyConfigProxyPort, call.arguments as Int?)
+        }
+        return null
     }
 
     /**
      * Store the requestTimeout config in shared preferences
      */
-    private fun methodConfigRequestTimeout(call: MethodCall, result: Result) {
-        updateSharedPreferences(keyConfigRequestTimeout, call.arguments as Int?)
-        result.success(null)
+    private suspend fun methodConfigRequestTimeout(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            updateSharedPreferences(keyConfigRequestTimeout, call.arguments as Int?)
+        }
+        return null
     }
 
     /**
      * Bypass the certificate validation
      */
-    private fun methodConfigBypassTLSCertificateValidation(result: Result) {
-        acceptUntrustedCertificates()
-        result.success(null)
+    private suspend fun methodConfigBypassTLSCertificateValidation(): Any? {
+        withContext(ioScope.coroutineContext) {
+            acceptUntrustedCertificates()
+        }
+        return null
     }
 
     /**
      * Store the availableSpace config in shared preferences
      */
-    private fun methodConfigCheckAvailableSpace(call: MethodCall, result: Result) {
-        updateSharedPreferences(keyConfigCheckAvailableSpace, call.arguments as Int?)
-        result.success(null)
+    private suspend fun methodConfigCheckAvailableSpace(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            updateSharedPreferences(keyConfigCheckAvailableSpace, call.arguments as Int?)
+        }
+        return null
     }
 
     /**
      * Store the useCacheDir config in shared preferences
      */
-    private fun methodConfigUseCacheDir(call: MethodCall, result: Result) {
-        updateSharedPreferences(keyConfigUseCacheDir, call.arguments as Int?)
-        result.success(null)
+    private suspend fun methodConfigUseCacheDir(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            updateSharedPreferences(keyConfigUseCacheDir, call.arguments as Int?)
+        }
+        return null
     }
 
     /**
      * Store the useExternalStorage config in shared preferences
      */
-    private fun methodConfigUseExternalStorage(call: MethodCall, result: Result) {
-        updateSharedPreferences(keyConfigUseExternalStorage, call.arguments as Int?)
-        result.success(null)
+    private suspend fun methodConfigUseExternalStorage(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            updateSharedPreferences(keyConfigUseExternalStorage, call.arguments as Int?)
+        }
+        return null
     }
 
 
     /**
      * Configure the holding queue
      */
-    private fun methodConfigHoldingQueue(call: MethodCall, result: Result) {
+    private fun methodConfigHoldingQueue(call: MethodCall): Any? {
         val arguments = call.arguments as List<*>
         if (arguments.isEmpty()) { // deactivate the holding queue
             holdingQueue = null
@@ -1209,14 +1264,14 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             holdingQueue?.maxConcurrentByHost = arguments[1] as Int
             holdingQueue?.maxConcurrentByGroup = arguments[2] as Int
         }
-        result.success(null)
+        return null
     }
 
     /**
      * Return the Android API version integer as a String
      */
-    private fun methodPlatformVersion(result: Result) {
-        result.success("${Build.VERSION.SDK_INT}")
+    private fun methodPlatformVersion(): String {
+        return "${Build.VERSION.SDK_INT}"
     }
 
 
@@ -1230,9 +1285,9 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      *
      * Returns suggested filename for this task, based on the task & content disposition
      */
-    private fun methodForceFailPostOnBackgroundChannel(call: MethodCall, result: Result) {
+    private fun methodForceFailPostOnBackgroundChannel(call: MethodCall): Any? {
         forceFailPostOnBackgroundChannel = call.arguments as Boolean
-        result.success(null)
+        return null
     }
 
     /**
@@ -1241,7 +1296,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      * For testing only
      *
      */
-    private fun methodTestSuggestedFilename(call: MethodCall, result: Result) {
+    private fun methodTestSuggestedFilename(call: MethodCall): String {
         val args = call.arguments as List<*>
         val taskJsonMapString = args[0] as String
         val contentDisposition = args[1] as String
@@ -1250,7 +1305,7 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             "Content-Disposition" to mutableListOf(contentDisposition)
         ) else mutableMapOf("" to mutableListOf())
         val t = task.withSuggestedFilenameFromResponseHeaders(applicationContext, h)
-        result.success(t.filename)
+        return t.filename
     }
 
     /**
@@ -1268,6 +1323,16 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
             apply()
         }
         Log.d(TAG, "Setting preference key $key to $value")
+    }
+
+    /**
+     * Store the skipExistingFiles config in shared preferences
+     */
+    private suspend fun methodConfigSkipExistingFiles(call: MethodCall): Any? {
+        withContext(ioScope.coroutineContext) {
+            updateSharedPreferences(keyConfigSkipExistingFiles, call.arguments as Int?)
+        }
+        return null
     }
 
 // ActivityAware implementation to capture Activity context needed for permissions and intents
@@ -1293,9 +1358,9 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
                     var success = false
                     while (retries < 5 && !success) {
                         try {
-                            if (backgroundChannel != null && scope != null) {
+                            if (backgroundChannel != null) {
                                 val resultCompleter = CompletableDeferred<Boolean>()
-                                scope?.launch {
+                                withContext(Dispatchers.Main) {
                                     backgroundChannel?.invokeMethod(
                                         "notificationTap",
                                         listOf(taskJsonMapString, notificationTypeOrdinal),
@@ -1366,7 +1431,6 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
     private fun attach(binding: ActivityPluginBinding) {
         detach()
         activity = binding.activity
-        scope = MainScope()
         binding.addRequestPermissionsResultListener(this)
         binding.addActivityResultListener(this)
         binding.addOnNewIntentListener(fun(intent: Intent?): Boolean {
@@ -1390,8 +1454,6 @@ class BDPlugin : FlutterPlugin, MethodCallHandler, ActivityAware,
      */
     private fun detach() {
         activity = null
-        scope?.cancel()
-        scope = null
     }
 
     /**

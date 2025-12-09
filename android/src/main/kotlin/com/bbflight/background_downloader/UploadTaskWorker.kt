@@ -400,7 +400,7 @@ class UploadTaskWorker(applicationContext: Context, workerParams: WorkerParamete
                     "Content-Disposition: form-data; name=\"${browserEncode(fileField)}\"; " +
                             "filename=\"${browserEncode(name)}\"$lineFeed"
                 )
-                if (filesData.size == 1) {
+                if (filesData.size == 1 && task.taskType != "MultiUploadTask") {
                     // only for single file uploads do we set the task's filename property
                     task = task.copyWith(
                         filename = if (fileUri != null) UriUtils.pack(
@@ -556,7 +556,7 @@ class UploadTaskWorker(applicationContext: Context, workerParams: WorkerParamete
         var header = "Content-Disposition: form-data; name=\"${browserEncode(name)}\""
         if (isJsonString(value)) {
             header = "$header\r\n" +
-                    "Content-Type: application/json; charset=utf-8\r\n"
+                    "Content-Type: application/json; charset=utf-8"
         } else if (!isPlainAscii(value)) {
             header = "$header\r\n" +
                     "Content-Type: text/plain; charset=utf-8\r\n" +
