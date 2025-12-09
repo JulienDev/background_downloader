@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:background_downloader/background_downloader.dart';
+import 'package:background_downloader_example/isolate.dart';
 import 'package:flutter/material.dart';
 import 'package:logging/logging.dart';
 
@@ -35,6 +36,8 @@ class _MyAppState extends State<MyApp> {
 
   bool loadAndOpenInProgress = false;
   bool loadABunchInProgress = false;
+  bool loadBackgroundInProgress = false;
+  String? loadBackgroundResult;
 
   @override
   void initState() {
@@ -75,6 +78,7 @@ class _MyAppState extends State<MyApp> {
                 'Download {filename}', 'Download failed'),
             paused: const TaskNotification(
                 'Download {filename}', 'Paused with metadata {metadata}'),
+            canceled: const TaskNotification('Download {filename}', 'Canceled'),
             progressBar: true)
         .configureNotificationForGroup('bunch',
             running: const TaskNotification(
@@ -112,6 +116,11 @@ class _MyAppState extends State<MyApp> {
           progressUpdateStream.add(update); // pass on to widget for indicator
       }
     });
+    // Start the FileDownloader. Default start means database tracking and
+    // proper handling of events that happened while the app was suspended,
+    // and rescheduling of tasks that were killed by the user.
+    // Start behavior can be configured with parameters
+    FileDownloader().start();
   }
 
   /// Process the user tapping on a notification by printing a message
@@ -122,6 +131,7 @@ class _MyAppState extends State<MyApp> {
 
   @override
   Widget build(BuildContext context) {
+    final onMobile = Platform.isAndroid || Platform.isIOS;
     return MaterialApp(
       theme: ThemeData(
         useMaterial3: true,
@@ -216,6 +226,42 @@ class _MyAppState extends State<MyApp> {
                             loadABunchInProgress ? null : processLoadABunch,
                         child: const Text('Load a bunch'))),
                 Center(child: Text(loadABunchInProgress ? 'Enqueueing' : '')),
+                const Divider(
+                  height: 30,
+                  thickness: 5,
+                  color: Colors.blueGrey,
+                ),
+                Center(
+                  child: ElevatedButton(
+                    onPressed:
+                        loadBackgroundInProgress ? null : processLoadBackground,
+                    child: const Text(
+                      'Load in background',
+                    ),
+                  ),
+                ),
+                Center(
+                  child: Text(
+                    loadBackgroundInProgress
+                        ? 'Working...'
+                        : loadBackgroundResult ?? '',
+                  ),
+                ),
+                if (onMobile)
+                  const Divider(
+                    height: 30,
+                    thickness: 5,
+                    color: Colors.blueGrey,
+                  ),
+                if (onMobile)
+                  Center(
+                    child: ElevatedButton(
+                      onPressed: processPickDirectory,
+                      child: const Text(
+                        'Pick destination',
+                      ),
+                    ),
+                  ),
               ],
             ),
           )),
@@ -364,6 +410,39 @@ class _MyAppState extends State<MyApp> {
         loadABunchInProgress = false;
       });
     }
+  }
+
+  Future<void> processLoadBackground() async {
+    if (!loadBackgroundInProgress) {
+      setState(() {
+        loadBackgroundInProgress = true;
+      });
+      await getPermission(PermissionType.notifications);
+      final result = await testBackgroundUsage();
+      setState(() {
+        loadBackgroundResult = result;
+        loadBackgroundInProgress = false;
+      });
+    }
+  }
+
+  Future<void> processPickDirectory() async {
+    final uri = await FileDownloader().uri.pickDirectory();
+    if (uri == null) {
+      log.warning('Could not get a URI');
+      return;
+    }
+    log.fine('Uri = $uri');
+    final task = UriDownloadTask(
+        url:
+            'https://i2.wp.com/www.skiptomylou.org/wp-content/uploads/2019/06/dog-drawing.jpg',
+        directoryUri: uri,
+        filename: '?');
+    final result = await FileDownloader().download(task);
+    final resultTask = result.task as UriDownloadTask;
+    log.info('Download to URI completed with taskStatus ${result.status}');
+    log.info('Downloaded file is at ${resultTask.fileUri}');
+    log.info('Downloaded file name is ${resultTask.filename}');
   }
 
   /// Attempt to get permissions if not already granted

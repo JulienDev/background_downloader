@@ -28,3 +28,18 @@ migrate_working_dir/
 .dart_tool/
 .packages
 build/
+
+# FVM Version Cache
+.fvm/
+.fvmrc
+
+# Ruby/Bundler for cocoa pods
+.ruby-version
+Gemfile*
+
+# Swift package manager
+.build/
+.swiftpm/
+
+# generated files
+*.mocks.dart

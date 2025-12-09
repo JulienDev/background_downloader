@@ -27,7 +27,7 @@ final task = DownloadTask(
     metaData: 'metaData',
     creationTime: DateTime.fromMillisecondsSinceEpoch(1000));
 const downloadTaskJsonString =
-    '{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","taskType":"DownloadTask"}';
+    '{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","options":null,"taskType":"DownloadTask"}';
 const downloadTaskJsonStringDoubles =
     '{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5.0,"retriesRemaining":5.0,"creationTime":1000.0,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1.0,"group":"group","updates":3.0,"requiresWiFi":true,"allowPause":true,"metaData":"metaData","taskType":"DownloadTask"}';
 
@@ -49,7 +49,7 @@ final uploadTask = UploadTask(
     metaData: 'metaData',
     creationTime: DateTime.fromMillisecondsSinceEpoch(1000));
 const uploadTaskJsonString =
-    '{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"PUT","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":false,"priority":5,"metaData":"metaData","displayName":"","taskType":"UploadTask","fileField":"fileField","mimeType":"application/octet-stream","fields":{"e":"f"}}';
+    '{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"PUT","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":false,"priority":5,"metaData":"metaData","displayName":"","options":null,"taskType":"UploadTask","fileField":"fileField","mimeType":"application/octet-stream","fields":{"e":"f"}}';
 const uploadTaskJsonStringDoubles =
     '{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"PUT","post":null,"retries":5.0,"retriesRemaining":5.0,"creationTime":1000.0,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1.0,"group":"group","updates":3.0,"requiresWiFi":true,"allowPause":false,"metaData":"metaData","fileField":"fileField","mimeType":"application/octet-stream","fields":{"e":"f"},"taskType":"UploadTask"}';
 
@@ -72,7 +72,7 @@ void main() {
       expect(jsonEncode(task3.toJson()), equals(uploadTaskJsonString));
     });
 
-    test('MultiUploadTask', () async {
+    test('MultiUploadTask using file or filePath', () async {
       // try with list of Strings
       var muTask = MultiUploadTask(
           taskId: 'task1',
@@ -137,6 +137,81 @@ void main() {
       expect(muTask.toJson()['taskType'], equals('MultiUploadTask'));
     });
 
+    test('MultiUploadTask using Uri', () async {
+      final uri = Uri.file('/f1.txt');
+      expect(uri.path, equals('/f1.txt'));
+      expect(uri.scheme, equals('file'));
+      expect(uri.toString(), equals('file:///f1.txt'));
+      // try with list of Uris
+      var muTask = MultiUploadTask(
+          taskId: 'task1',
+          url: urlWithContentLength,
+          files: [Uri.file('/f1.txt'), Uri.file('/f2.txt')]);
+      expect(muTask.fileFields, equals(['file1', 'file2']));
+      expect(muTask.filenames, equals(['file:///f1.txt', 'file:///f2.txt']));
+      expect(muTask.mimeTypes, equals(['', '']));
+      expect(muTask.fileField, equals('["file1","file2"]')); // json string
+      expect(muTask.filename,
+          equals('["file:///f1.txt","file:///f2.txt"]')); // json string
+      expect(muTask.mimeType, equals('["",""]')); // json string
+      var muTask2 = MultiUploadTask.fromJson(muTask.toJson());
+      expect(muTask2.taskId, equals(muTask.taskId));
+      expect(muTask2.fileFields, equals(muTask.fileFields));
+      expect(muTask2.filenames, equals(muTask.filenames));
+      expect(muTask2.mimeTypes, equals(muTask.mimeTypes));
+      expect(muTask2.fileField, equals(muTask.fileField));
+      expect(muTask2.filename, equals(muTask.filename));
+      expect(muTask2.mimeType, equals(muTask.mimeType));
+      // try with list of (String, Uri)
+      muTask = MultiUploadTask(
+          taskId: 'task2',
+          url: urlWithContentLength,
+          files: [
+            ('file1', Uri.file('/f1.txt')),
+            ('file2', Uri.file('/f2.txt'))
+          ]);
+      expect(muTask.fileFields, equals(['file1', 'file2']));
+      expect(muTask.filenames, equals(['file:///f1.txt', 'file:///f2.txt']));
+      expect(muTask.mimeTypes, equals(['', '']));
+      expect(muTask.fileField, equals('["file1","file2"]'));
+      expect(muTask.filename,
+          equals('["file:///f1.txt","file:///f2.txt"]')); // json string
+      expect(muTask.mimeType, equals('["",""]')); // json string
+      muTask2 = MultiUploadTask.fromJson(muTask.toJson());
+      expect(muTask2.taskId, equals(muTask.taskId));
+      expect(muTask2.fileFields, equals(muTask.fileFields));
+      expect(muTask2.filenames, equals(muTask.filenames));
+      expect(muTask2.mimeTypes, equals(muTask.mimeTypes));
+      expect(muTask2.fileField, equals(muTask.fileField));
+      expect(muTask2.filename, equals(muTask.filename));
+      expect(muTask2.mimeType, equals(muTask.mimeType));
+      //try with list of (String, Uri, String)
+      muTask = MultiUploadTask(
+          taskId: 'task3',
+          url: urlWithContentLength,
+          files: [
+            ('file1', Uri.file('/f1.txt'), 'text/plain'),
+            ('file2', Uri.file('/f2'))
+          ]);
+      expect(muTask.fileFields, equals(['file1', 'file2']));
+      expect(muTask.filenames, equals(['file:///f1.txt', 'file:///f2']));
+      expect(muTask.mimeTypes, equals(['text/plain', '']));
+      expect(muTask.fileField, equals('["file1","file2"]'));
+      expect(muTask.filename,
+          equals('["file:///f1.txt","file:///f2"]')); // json string
+      expect(muTask.mimeType, equals('["text/plain",""]'));
+      muTask2 = MultiUploadTask.fromJson(muTask.toJson());
+      expect(muTask2.taskId, equals(muTask.taskId));
+      expect(muTask2.fileFields, equals(muTask.fileFields));
+      expect(muTask2.filenames, equals(muTask.filenames));
+      expect(muTask2.mimeTypes, equals(muTask.mimeTypes));
+      expect(muTask2.fileField, equals(muTask.fileField));
+      expect(muTask2.filename, equals(muTask.filename));
+      expect(muTask2.mimeType, equals(muTask.mimeType));
+      // check taskType
+      expect(muTask.toJson()['taskType'], equals('MultiUploadTask'));
+    });
+
     test('ParallelDownloadTask', () async {
       // single url
       var pdlTask = ParallelDownloadTask(url: urlWithLongContentLength);
@@ -169,7 +244,7 @@ void main() {
       final statusUpdate = TaskStatusUpdate(
           task, TaskStatus.failed, TaskConnectionException('test'));
       const expected =
-          '{"task":{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","taskType":"DownloadTask"},"taskStatus":4,"exception":{"type":"TaskConnectionException","description":"test"},"responseBody":null,"responseHeaders":null,"responseStatusCode":null,"mimeType":null,"charSet":null}';
+          '{"task":{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","options":null,"taskType":"DownloadTask"},"taskStatus":4,"exception":{"type":"TaskConnectionException","description":"test"},"responseBody":null,"responseHeaders":null,"responseStatusCode":null,"mimeType":null,"charSet":null}';
       expect(jsonEncode(statusUpdate.toJson()), equals(expected));
       final update2 = TaskStatusUpdate.fromJson(jsonDecode(expected));
       expect(update2.task, equals(statusUpdate.task));
@@ -187,7 +262,7 @@ void main() {
     test('TaskProgressUpdate', () {
       final progressUpdate = TaskProgressUpdate(task, 1, 123);
       const expected =
-          '{"task":{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","taskType":"DownloadTask"},"progress":1.0,"expectedFileSize":123,"networkSpeed":-1.0,"timeRemaining":-1}';
+          '{"task":{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","options":null,"taskType":"DownloadTask"},"progress":1.0,"expectedFileSize":123,"networkSpeed":-1.0,"timeRemaining":-1}';
       expect(jsonEncode(progressUpdate.toJson()), equals(expected));
       final update2 = TaskProgressUpdate.fromJson(jsonDecode(expected));
       expect(update2.task, equals(progressUpdate.task));
@@ -205,7 +280,7 @@ void main() {
       final taskRecord =
           TaskRecord(task, TaskStatus.failed, 1, 123, TaskUrlException('test'));
       const expected =
-          '{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","taskType":"DownloadTask","status":4,"progress":1.0,"expectedFileSize":123,"exception":{"type":"TaskUrlException","description":"test"}}';
+          '{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","options":null,"taskType":"DownloadTask","status":4,"progress":1.0,"expectedFileSize":123,"exception":{"type":"TaskUrlException","description":"test"}}';
       expect(jsonEncode(taskRecord.toJson()), equals(expected));
       final update2 = TaskRecord.fromJson(jsonDecode(expected));
       expect(update2.task, equals(taskRecord.task));
@@ -223,7 +298,7 @@ void main() {
     test('ResumeData', () {
       final resumeData = ResumeData(task, 'data', 123, 'tag');
       const expected =
-          '{"task":{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","taskType":"DownloadTask"},"data":"data","requiredStartByte":123,"eTag":"tag"}';
+          '{"task":{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","options":null,"taskType":"DownloadTask"},"data":"data","requiredStartByte":123,"eTag":"tag"}';
       expect(jsonEncode(resumeData.toJson()), equals(expected));
       final update2 = ResumeData.fromJson(jsonDecode(expected));
       expect(update2.task, equals(resumeData.task));
@@ -236,7 +311,7 @@ void main() {
           equals(expected));
       final resumeData2 = ResumeData(task, 'data', 123, null);
       const expected2 =
-          '{"task":{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","taskType":"DownloadTask"},"data":"data","requiredStartByte":123,"eTag":null}';
+          '{"task":{"url":"url?a=b","headers":{"c":"d"},"httpRequestMethod":"GET","post":null,"retries":5,"retriesRemaining":5,"creationTime":1000,"taskId":"taskId","filename":"filename","directory":"dir","baseDirectory":1,"group":"group","updates":3,"requiresWiFi":true,"allowPause":true,"priority":5,"metaData":"metaData","displayName":"","options":null,"taskType":"DownloadTask"},"data":"data","requiredStartByte":123,"eTag":null}';
       expect(jsonEncode(resumeData2.toJson()), equals(expected2));
       final update3 = ResumeData.fromJson(jsonDecode(expected2));
       expect(update3.task, equals(resumeData.task));

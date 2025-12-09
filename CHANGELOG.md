@@ -1,3 +1,192 @@
+## 9.4.0
+
+* Improves concurrency on mobile platforms by moving JSON encoding and decoding to an isolate, and introducing a job queue to ensure ordered message execution.
+* Adds `Config.skipExistingFiles` configuration option to skip the download if the destination file already exists (and conditionally does this only for files greater than a certain size)
+
+## 9.3.0
+
+Main change is in Android concurrency, triggered by the [Great Thread Merge](https://github.com/flutter/flutter/issues/150525) that causes UI blocking issues for recent versions of Flutter. The concurrency approach has been changed, but note this can cause minor changes in - for example - the sequence in which certain events happen.
+
+* Feature improvements
+  - Add pause and resume functionality to TaskQueue using `pauseAll` and `resumeAll`. These methods are now called when pausing or resuming all tasks using the `FileDownloader`
+
+* Bug fixes
+  - Fix issue with MultiUploadTask when uploading only one file
+  - UriUtils subclasses are now private, as they should have been to start with
+  - Address Dart analyzer recommendations
+
+## 9.2.6
+
+* Bug fix
+  - [Android] Fix Tap to open (on notification) bug, introduced in 9.2.4
+
+* Version upgrades
+  - [Android] compileSDK set to 36, targetSDK for example app set to 36, Kotlin compiler in example app set to 2.1.0
+
+## 9.2.5
+
+* Minor bug fixes
+  - [iOS] catch file write errors in multi-part uploads
+  - [iOS] fix optional unwrap error 
+
+## 9.2.4
+
+* Minor bug fixes
+  - [iOS] Notification update after killed app resumes
+  - [Android] Use of UTF-8 characters in `post` field
+  - Multipart upload remove extraneous CR/LF after header
+  - [Android] Fallback for expedited tasks when encountering OS error
+  - [Android] fix `enqueAll` and similar calls when no Activity attached
+
+## 9.2.3
+
+* Minor bug fixes
+  - [Android] Unmarking temp files as cache after move to download destination
+  - [iOS] Improved permissions bypassing
+  - [Android] Use of $ sign in notification substitutions
+  - [iOS] Crash on returning app to foreground when app is suspended
+
+## 9.2.2
+* Adds option to set the `Content-Disposition` header for binary uploads
+* Fixes bug on iOS when using `openFile` with a filepath containing spaces
+
+For binary uploads, the `Content-Disposition` header will be:
+- set to 'attachment = "filename"' if the task.headers field does not contain an entry for 'Content-Disposition' (the prior default)
+- not set at all (i.e. omitted) if the task.headers field contains an entry for 'Content-Disposition' with the value '' (an empty string)
+- set to the value of `task.headers['Content-Disposition']` in all other cases
+
+## 9.2.1
+* Minor bug fixes
+
+## 9.2.0
+* Adds `updates` broadcast stream to the `database` property, which emits every `TaskRecord` update made to the database.
+* Fixes issue with `start` and `rescheduleKilledTasks` when using group names for tasks
+* Minor bug fixes and enhancements
+
+## 9.1.1
+* Adds optional `group` parameter to `resumeAll`
+* Fixes concurrency bugs in Android
+
+## 9.1.0
+* Adds `pauseAll`, `cancelAll` and `resumeAll`
+* Improves handling `enqueuAll` to not starve the UI thread
+* Fixes compilation bug when compiling with XCode 16.2
+
+## 9.0.0
+* Introduces URI operations, including file/photo/video/directory pickers, under the `uri` property, and `UriDownloadTask` and `UriUploadTask`. See [Working with URIs](doc/URI.md). 
+* [Breaking] removes references to `asAndroidUri` - use the new methods on the `uri` property instead
+* Adds `enqueueAll` to enqueue a list of tasks (non-blocking and with better performance when compared to calling `enqueue` for each task)
+* Adds native callback `beforeTaskStartCallback` to `TaskOptions`, that is called just before the task starts executing. If it returns a non-null `TaskStatusUpdate` then this forces the task to finish before it starts, with that `TaskStatusUpdate`
+* Adds option to configure a `canceled` notification (instead of cancellation defaulting to the `error` notification)
+* Fixes bug with `request` when using `PUT` or `PATCH` requests
+* Fixes bug for multi-part uploads when field values are formatted as a JSON string and contain non-ASCII characters
+* Bumps minimum iOS version to 14
+
+### Uri operations
+
+Uri operations abstract away platform differences, including content provider on Android (used for the Storage Access Framework), and file, photo and directory pickers on iOS and Android. This enables largely platform-independent code for file operations, and on Android downloads directly to destination, bypassing the temp file in internal storage.
+
+The `FileDownloader().uri` property provides access to a set of utility functions for working with URIs, including:
+
+*   `pickDirectory()`: Opens a directory picker dialog and returns the selected directory's URI.
+*   `pickFile()`: Opens a file picker dialog and returns the selected file's URI.
+*   `pickFiles()`: Opens a file picker dialog and allows selection of multiple files, returning their URIs in a list.
+*   `createDirectory()`: Creates a new directory within a specified parent directory URI.
+*   `getFileBytes()`: Retrieves the file data (bytes) for a given URI.
+*   `copyFile()`: copies a file from a source uri to a destination. Destination can be a `Uri`, a `File` or a `String` containing a file path
+*   `moveFile()`: moves a file from a source uri to a destination. Destination can be a `Uri`, a `File` or a `String` containing a file path. If the move fails, it is possible that the file was copied but the source was not deleted
+*   `deleteFile()`: Deletes the file at the given URI.
+*   `openFile()`: Opens the file at a given URI.
+*   `moveToSharedStorage()`: Moves a file to a shared storage location.
+*   `activate()`: Activates a previously accessed directory or file. Only relevant if you use `persistedUriPermission` or use the photo/video picker.
+
+The `pick...` methods and `createDirectory` take an optional `persistedUriPermission` argument (defaults to `false`) that when `true` registers the picked directory with the OS, allowing access in a later session.
+
+New/modified `Task` types:
+*   `UriDownloadTask`: Downloads a file to a specified directory URI. On Android, this bypasses the temp file used in the traditional approach and downloads directly to the destination.
+*   `UriUploadTask`: Uploads a file from a given file URI. If the `filename` is omitted, it will be based on the task's URL.
+*   `MultiUploadTask`: now accepts Uri where previously only filename or file path was allowed
+
+## 8.9.5
+* Fixes issue with `start` and `rescheduleKilledTasks` when using group names for tasks
+
+## 8.9.4
+* Modifies the interval between `TaskProgressUpdate` such that an update is sent at least once every 2.5 seconds if progress has been made, even if it less than 2% of the file size
+* Improves `rescheduleKilledTasks` to also reschedule tasks marked as `waitingToRetry` but not registered as such
+
+## 8.9.3
+* Adds `start` which ensures the various start-up calls are executed in the correct order. Use this instead of calling `trackTasks`, `resumeFromBackground` and `rescheduleKilledTasks` separately
+* Adds `rescheduleKilledTasks` which will compare enqueued/running tasks in the database with those active in the downloader, and reschedules those that have been killed by the user
+* [iOS] Removes limit on range of partial file uploads using the Range header (was 2GB)
+
+## 8.9.2
+* Adds `rescheduleMissingTasks`, which compares tasks in the `database` with tasks in the native downloader, and reschedules those tasks that are present in the database (and therefore should be enqueued or running) but are not present in the native downloader. Returns two lists of `Task` - successfully rescheduled ones, and tasks that failed to reschedule.
+* Upgraded minimum Dart SDK to 3.5.0 / Flutter SDK 3.24.0 to stay in sync with dependency updates
+* [Android] Fix bug when uploading files greater than 2GB, that was introduced in V8.9.0
+
+## 8.9.1
+* [iOS] Adds Privacy Manifest
+* [iOS] Adds support for Swift Package Manager and defaults the example app to using it
+
+## 8.9.0
+* Adds `options` field to Task, which take a `TaskOptions` object to configure less common task specific options - currently `onTaskStart`, `onTaskFinished` and `auth`
+  - `onTaskStart` is a callback with signature`Future<Task?> Function(Task original)`, called just before the task starts executing. Your callback receives the `original` task about to start, and can modify this task if necessary. If you make modifications, you return the modified task - otherwise return null to continue execution with the original task. You can only change the task's `url` (including query parameters) and `headers` properties - making changes to any other property may lead to undefined behavior.
+  - `onTaskFinished` is a callback with signature `Future<void> Function(TaskStatusUpdate taskStatusUpdate)`, called when the task has reached a final state (regardless of outcome). Your callback receives the final `TaskStatusUpdate` and can act on that.
+  - `auth` is an optional `Auth` object that helps manage accessToken and accessToken refresh - see the README for details
+  - __NOTE:__ The callback functionality is experimental for now, and its behavior may change without warning in future updates. Please provide feedback on callbacks
+* Upgrades Android Java version to version 17 (modifies build.gradle)
+* Fixes concurrency issue on iOS
+* Changes how `numTotal` is calculated for group notifications: `numTotal` is now increment when a task is enqueued, instead of when it starts running. Note that this can lead to a '0/20 files' type notification if the tasks are enqueued but cannot start due to a constraint such as requiring WiFi
+* Expands type of Android URI that can be used to upload a file (was MediaStore URIs only, now accepts any Android URI, e.g. one provided by a document provider such as a file picker)
+
+## 8.8.1
+
+* Fixes Android bug where timeout timer is not cleaned up after use
+
+## 8.8.0
+
+* [iOS] Adds configuration option to exclude downloaded files from iCloud backup
+* Adds `allGroups` parameter to `allTasks` and `allTaskIds` methods, to retrieve all tasks regardless of `group`
+* [Android] Fixes issue with un-commanded restart of a download in specific scenarios
+
+## 8.7.1
+
+* Fix for compilation issue on Kotlin 2
+
+## 8.7.0
+
+* Adds option to specify a file location for upload using a Mediastore URI on Android, using `UploadTask.fromUri`. A Mediastore URI can also be requested from methods `moveToSharedStorage` and `pathInSharedStorage` by adding `asAndroidUri = true` to the call.
+* Fixes bug with ParallelDownload when an error occurs
+* Updates dependency on package mime to 2.0, therefore also Dart 3.2 (Flutter 3.16.0) or greater. Use `dependency_overrides` in pubspec.yaml to resolve (background_downloader works with 1.0 and 2.0)
+
+## 8.6.0
+
+* Adds option for partial uploads, for binary uploads only. Set the byte range by adding a "Range" header to your binary `UploadTask`, e.g. a value of "bytes=100-149" will upload 50 bytes starting at byte 100. You can omit the range end (but not the "-") to upload from the indicated start byte to the end of the file.  The "Range" header will not be passed on to the server. Note that on iOS an invalid range will cause enqueue to fail, whereas on Android and Desktop the task will fail when attempting to start.
+* Fixes issue in iOS when multiple Flutter engines register the plugin
+* Fixes issue with lingering HTTP connections on desktop
+* Adds CI workflow (formatting, lints, build Android, build iOS)
+
+## 8.5.6
+
+* Fixes desktop upload cancellation bug
+* Adds Url-encoding of Content-Disposition header for binary uploads. Note for multipart uploads, filename is 'browserEncoded' which does not encode Non-ASCII characters
+* Fixes bug with creation of unique filename on iOS 
+
+## 8.5.5
+
+* Fixes concurrent database write bug for TaskRecords
+
+## 8.5.4
+
+* If the value of a `fields` entry of an `UploadTask` is in JSON format (defined as start/end with {} or []) then the field's mime-type will be set to `application/json`, whereas it would not have been set prior
+* Fixes an issue on iOS where use of the holding queue can lead to deadlock
+* For Windows, when using `BaseDirectory.root`, fixes an issue with `Task.split` and `Task.baseDirectoryPath`. When using `BaseDirectory.root` on Windows, your task's `directory` must contain the drive letter.
+
+## 8.5.3
+
+* Bug fixes
+* Improvements to documentation
+
 ## 8.5.2
 
 * Removes references to `dart:html` to allow web compilation using WASM. Note the package still does not work on the web
@@ -9,7 +198,7 @@
 
 ## 8.5.0
 
-* Adds `DataTask` fro scheduled server requests
+* Adds `DataTask` for scheduled server requests
 * Fixes bug omitting Content-Type header for iOS uploads, and Content-Disposition header for desktop uploads
 
 ### DataTask

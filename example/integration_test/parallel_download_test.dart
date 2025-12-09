@@ -299,6 +299,7 @@ void main() {
       expect(await FileDownloader().pause(task), isTrue);
       await Future.delayed(const Duration(seconds: 1));
       expect(lastStatus, equals(TaskStatus.paused));
+      await Future.delayed(const Duration(seconds: 1));
       expect(lastProgress, equals(progressPaused));
       await Future.delayed(const Duration(seconds: 2));
       expect(await FileDownloader().resume(task), isTrue);
@@ -312,6 +313,7 @@ void main() {
     });
   });
 
+  /// Skipped by default as these tests fail unless code modifications are made
   group('Modifications', () {
     // Tests in this group require modification of the source code
     // and may fail without that
@@ -380,7 +382,7 @@ void main() {
       expect(file.existsSync(), isTrue);
       expect(await fileEqualsTestFile(file), isTrue);
     });
-  });
+  }, skip: true);
 }
 
 /// Returns true if the supplied file equals the test file

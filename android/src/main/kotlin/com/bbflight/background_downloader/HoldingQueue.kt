@@ -109,6 +109,10 @@ class HoldingQueue(private val workManager: WorkManager) {
         stateMutex.withLock {
             queue.add(item)
             enqueuedTaskIds.add(item.task.taskId)
+            NotificationService.registerEnqueue(
+                item,
+                success = true
+            ) // for group notification count
         }
         advanceQueue()
     }
@@ -137,7 +141,7 @@ class HoldingQueue(private val workManager: WorkManager) {
         val prefs = PreferenceManager.getDefaultSharedPreferences(context)
         toRemove.forEach {
             queue.remove(it)
-            TaskWorker.processStatusUpdate(it.task, TaskStatus.canceled, prefs)
+            TaskWorker.processStatusUpdate(it.task, TaskStatus.canceled, prefs, context = context)
             Log.i(BDPlugin.TAG, "Canceled task with id ${it.task.taskId}")
         }
         removedTaskIds = toRemove.map { it.task.taskId }.toMutableList()
@@ -173,13 +177,13 @@ class HoldingQueue(private val workManager: WorkManager) {
     }
 
     /**
-     * Return list of [Task] for this [group]
+     * Return list of [Task] for this [group]. If [group] is null, all tasks will be returned
      *
      * Because this is used in combination with the WorkManager tasks, use of this method
      * requires the caller to acquire the [stateMutex]
      */
-    fun allTasks(group: String): List<Task> {
-        return queue.filter { it.task.group == group }.map { it.task }
+    fun allTasks(group: String?): List<Task> {
+        return queue.filter { group == null || it.task.group == group }.map { it.task }
     }
 
     /**
@@ -276,10 +280,10 @@ class HoldingQueue(private val workManager: WorkManager) {
  * and in the context of the [HoldingQueue]
  */
 class EnqueueItem(
-    private val context: Context,
+    val context: Context,
     val task: Task,
-    private val notificationConfigJsonString: String?,
-    private val resumeData: ResumeData?,
+    val notificationConfigJsonString: String?,
+    private val resumeData: ResumeData? = null,
     private val plugin: BDPlugin? = null,
     private val created: Date = Date()
 ) : Comparable<EnqueueItem> {
@@ -307,6 +311,7 @@ class EnqueueItem(
                 ), context = context
             )
             BDPlugin.holdingQueue?.taskFinished(task)
+            NotificationService.registerEnqueue(this, success = false)
         }
         delay(20)
     }

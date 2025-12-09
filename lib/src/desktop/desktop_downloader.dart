@@ -45,6 +45,7 @@ final class DesktopDownloader extends BaseDownloader {
   static Duration? _requestTimeout;
   static var _proxy = <String, dynamic>{}; // 'address' and 'port'
   static var _bypassTLSCertificateValidation = false;
+  static int _skipExistingFiles = -1;
 
   factory DesktopDownloader() => _singleton;
 
@@ -63,6 +64,15 @@ final class DesktopDownloader extends BaseDownloader {
     processStatusUpdate(TaskStatusUpdate(task, TaskStatus.enqueued));
     _advanceQueue();
     return true;
+  }
+
+  @override
+  Future<List<bool>> enqueueAll(Iterable<Task> tasks) async {
+    final results = <bool>[];
+    for (final task in tasks) {
+      results.add(await enqueue(task));
+    }
+    return results;
   }
 
   /// Advance the queue if it's not empty and there is room in the run queue
@@ -116,12 +126,25 @@ final class DesktopDownloader extends BaseDownloader {
   /// 'forwarded' to the [backgroundChannel] and processed by the
   /// [FileDownloader]
   Future<void> _executeTask(Task task) async {
+    // Check if the file should be skipped
+    if (task is DownloadTask && _skipExistingFiles != -1) {
+      final filePath = await task.filePath();
+      final file = File(filePath);
+      if (await file.exists()) {
+        final fileSize = await file.length();
+        if (fileSize > _skipExistingFiles * 1024 * 1024) {
+          processStatusUpdate(TaskStatusUpdate(
+              task, TaskStatus.complete, null, null, null, 304));
+          return;
+        }
+      }
+    }
+
     final resumeData = await getResumeData(task.taskId);
     if (resumeData != null) {
       await removeResumeData(task.taskId);
     }
     final isResume = _resume.remove(task) && resumeData != null;
-    final filePath = await task.filePath(); // "" for MultiUploadTask
     // spawn an isolate to do the task
     final receivePort = ReceivePort();
     final errorPort = ReceivePort();
@@ -147,7 +170,6 @@ final class DesktopDownloader extends BaseDownloader {
     final sendPort = await messagesFromIsolate.next as SendPort;
     sendPort.send((
       task,
-      filePath,
       resumeData,
       isResume,
       requestTimeout,
@@ -300,9 +322,12 @@ final class DesktopDownloader extends BaseDownloader {
 
   @override
   Future<List<Task>> allTasks(
-      String group, bool includeTasksWaitingToRetry) async {
+      String group, bool includeTasksWaitingToRetry, allGroups) async {
     final retryAndPausedTasks =
-        await super.allTasks(group, includeTasksWaitingToRetry);
+        await super.allTasks(group, includeTasksWaitingToRetry, allGroups);
+    if (allGroups) {
+      return [...retryAndPausedTasks, ..._queue.unorderedElements, ..._running];
+    }
     final inQueue =
         _queue.unorderedElements.where((task) => task.group == group);
     final running = _running.where((task) => task.group == group);
@@ -366,6 +391,12 @@ final class DesktopDownloader extends BaseDownloader {
   }
 
   @override
+  Future<List<bool>> pauseTaskList(Iterable<Task> tasksToPause) async {
+    final pauseCalls = tasksToPause.map((task) => pause(task));
+    return Future.wait(pauseCalls);
+  }
+
+  @override
   Future<bool> resume(Task task) async {
     if (await super.resume(task)) {
       task = awaitTasks.containsKey(task)
@@ -393,7 +424,12 @@ final class DesktopDownloader extends BaseDownloader {
 
   @override
   Future<String?> moveToSharedStorage(String filePath,
-      SharedStorage destination, String directory, String? mimeType) async {
+      SharedStorage destination, String directory, String? mimeType,
+      {bool asUriString = false}) async {
+    final fileUri = Uri.tryParse(filePath);
+    if (fileUri case Uri(scheme: 'file')) {
+      filePath = fileUri.toFilePath(windows: Platform.isWindows);
+    }
     final destDirectoryPath =
         await getDestinationDirectoryPath(destination, directory);
     if (destDirectoryPath == null) {
@@ -410,19 +446,21 @@ final class DesktopDownloader extends BaseDownloader {
       _log.warning('Error moving $filePath to shared storage: $e');
       return null;
     }
-    return destFilePath;
+    return asUriString ? Uri.file(destFilePath).toString() : destFilePath;
   }
 
   @override
   Future<String?> pathInSharedStorage(
-      String filePath, SharedStorage destination, String directory) async {
+      String filePath, SharedStorage destination, String directory,
+      {bool asUriString = false}) async {
     final destDirectoryPath =
         await getDestinationDirectoryPath(destination, directory);
     if (destDirectoryPath == null) {
       return null;
     }
     final fileName = path.basename(filePath);
-    return path.join(destDirectoryPath, fileName);
+    var destFilePath = path.join(destDirectoryPath, fileName);
+    return asUriString ? Uri.file(destFilePath).toString() : destFilePath;
   }
 
   /// Returns the path of the destination directory in shared storage, or null
@@ -522,6 +560,23 @@ final class DesktopDownloader extends BaseDownloader {
         maxConcurrentByHost = maxConcurrentByHostParam ?? unlimited;
         maxConcurrentByGroup = maxConcurrentByGroupParam ?? unlimited;
 
+      case (Config.holdingQueue, Config.never):
+      case (Config.holdingQueue, false):
+        maxConcurrent = unlimited;
+        maxConcurrentByHost = unlimited;
+        maxConcurrentByGroup = unlimited;
+
+      case (Config.skipExistingFiles, int value):
+        _skipExistingFiles = value;
+
+      case (Config.skipExistingFiles, Config.never):
+      case (Config.skipExistingFiles, false):
+        _skipExistingFiles = -1;
+
+      case (Config.skipExistingFiles, Config.always):
+      case (Config.skipExistingFiles, true):
+        _skipExistingFiles = 0;
+
       default:
         return (
           configItem.$1,
@@ -572,7 +627,7 @@ final class DesktopDownloader extends BaseDownloader {
   }
 
   /// Recreates the [httpClient] used for Requests and isolate downloads/uploads
-  static _recreateClient() {
+  static void _recreateClient() {
     final client = HttpClient();
     client.connectionTimeout = requestTimeout;
     client.findProxy = proxy.isNotEmpty

@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
-import 'package:background_downloader/src/permissions.dart';
-import 'package:background_downloader/src/queue/task_queue.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:logging/logging.dart';
@@ -12,8 +10,11 @@ import 'base_downloader.dart';
 import 'database.dart';
 import 'localstore/localstore.dart';
 import 'models.dart';
+import 'permissions.dart';
 import 'persistent_storage.dart';
+import 'queue/task_queue.dart';
 import 'task.dart';
+import 'uri/uri_utils.dart';
 import 'web_downloader.dart'
     if (dart.library.io) 'desktop/desktop_downloader.dart';
 
@@ -42,7 +43,11 @@ interface class FileDownloader {
   /// rationale for this permission should be shown
   Permissions get permissions => _downloader.permissionsService;
 
+  /// Platform-specific implementation of the downloader itself
   late final BaseDownloader _downloader;
+
+  /// Accesses utilities for working with URIs
+  UriUtils? _uri;
 
   /// Do not use: for testing only
   @visibleForTesting
@@ -69,6 +74,14 @@ interface class FileDownloader {
   /// Stream of [TaskUpdate] updates for downloads that do
   /// not have a registered callback
   Stream<TaskUpdate> get updates => _downloader.updates.stream;
+
+  /// Accesses utilities for working with URIs. URIs make working with file pickers and
+  /// shared storage easier, as they abstract permissions and are coherent
+  /// across platforms.
+  UriUtils get uri {
+    _uri ??= UriUtils.withDownloader(_downloader);
+    return _uri!;
+  }
 
   /// Configures the downloader
   ///
@@ -199,6 +212,13 @@ interface class FileDownloader {
   /// - you want more detailed progress information
   ///   (e.g. file size, network speed, time remaining)
   Future<bool> enqueue(Task task) => _downloader.enqueue(task);
+
+  /// Enqueues a list of tasks and returns a list of booleans indicating whether
+  /// each task was successfully enqueued
+  ///
+  /// See [enqueue] for details
+  Future<List<bool>> enqueueAll(Iterable<Task> tasks) =>
+      _downloader.enqueueAll(tasks);
 
   /// Download a file and return the final [TaskStatusUpdate]
   ///
@@ -340,10 +360,7 @@ interface class FileDownloader {
   /// a value less than one second.
   /// The [onElapsedTime] callback should not be used to indicate progress.
   ///
-  /// Note that to allow for special processing of tasks in a batch, the task's
-  /// [Task.group] and [Task.updates] value will be modified when enqueued, and
-  /// those modified tasks are returned as part of the [Batch]
-  /// object.
+  /// [tasks] cannot be an empty list
   Future<Batch> downloadBatch(final List<DownloadTask> tasks,
           {BatchProgressCallback? batchProgressCallback,
           TaskStatusCallback? taskStatusCallback,
@@ -382,10 +399,7 @@ interface class FileDownloader {
   /// a value less than one second.
   /// The [onElapsedTime] callback should not be used to indicate progress.
   ///
-  /// Note that to allow for special processing of tasks in a batch, the task's
-  /// [Task.group] and [Task.updates] value will be modified when enqueued, and
-  /// those modified tasks are returned as part of the [Batch]
-  /// object.
+  /// [tasks] cannot be an empty list
   Future<Batch> uploadBatch(final List<UploadTask> tasks,
           {BatchProgressCallback? batchProgressCallback,
           TaskStatusCallback? taskStatusCallback,
@@ -417,12 +431,16 @@ interface class FileDownloader {
   ///
   /// This method acts on a [group] of tasks. If omitted, the [defaultGroup]
   /// is used, which is the group used when you [enqueue] a task
+  /// To get all tasks regardless of group, set [allGroups] to true as the
+  /// only parameter
   Future<List<String>> allTaskIds(
           {String group = defaultGroup,
-          bool includeTasksWaitingToRetry = true}) async =>
+          bool includeTasksWaitingToRetry = true,
+          allGroups = false}) async =>
       (await allTasks(
               group: group,
-              includeTasksWaitingToRetry: includeTasksWaitingToRetry))
+              includeTasksWaitingToRetry: includeTasksWaitingToRetry,
+              allGroups: allGroups))
           .map((task) => task.taskId)
           .toList();
 
@@ -433,10 +451,13 @@ interface class FileDownloader {
   ///
   /// This method acts on a [group] of tasks. If omitted, the [defaultGroup]
   /// is used, which is the group used when you [enqueue] a task.
+  /// To get all tasks regardless of group, set [allGroups] to true as the
+  /// only parameter
   Future<List<Task>> allTasks(
           {String group = defaultGroup,
-          bool includeTasksWaitingToRetry = true}) =>
-      _downloader.allTasks(group, includeTasksWaitingToRetry);
+          bool includeTasksWaitingToRetry = true,
+          bool allGroups = false}) =>
+      _downloader.allTasks(group, includeTasksWaitingToRetry, allGroups);
 
   /// Returns true if tasks in this [group] are finished
   ///
@@ -470,7 +491,7 @@ interface class FileDownloader {
   ///
   /// Every canceled task wil emit a [TaskStatus.canceled] update to
   /// the registered callback, if requested
-  Future<bool> cancelTasksWithIds(List<String> taskIds) =>
+  Future<bool> cancelTasksWithIds(Iterable<String> taskIds) =>
       _downloader.cancelTasksWithIds(taskIds);
 
   /// Cancel this task
@@ -479,6 +500,18 @@ interface class FileDownloader {
   /// the registered callback, if requested
   Future<bool> cancelTaskWithId(String taskId) => cancelTasksWithIds([taskId]);
 
+  /// Cancel this task
+  ///
+  /// The task will emit a [TaskStatus.canceled] update to
+  /// the registered callback, if requested
+  Future<bool> cancel(Task task) => cancelTasksWithIds([task.taskId]);
+
+  /// Cancels all tasks, or those in [tasks], or all tasks in group [group]
+  ///
+  /// Returns true if all cancellations were successful
+  Future<bool> cancelAll({Iterable<Task>? tasks, String? group}) =>
+      _downloader.cancelAll(tasks: tasks, group: group);
+
   /// Return [Task] for the given [taskId], or null
   /// if not found.
   ///
@@ -486,6 +519,34 @@ interface class FileDownloader {
   /// does not guarantee that the task is still running. To keep track of
   /// the status of tasks, use a [TaskStatusCallback]
   Future<Task?> taskForId(String taskId) => _downloader.taskForId(taskId);
+
+  /// Convenience start method for using the database. Must be called AFTER
+  /// registering update callbacks or listener.
+  ///
+  /// Calls in order:
+  /// [trackTasks] to start database tracking, with [markDownloadedComplete] to
+  ///     ensure fully downloaded tasks are marked as complete in the database
+  /// [resumeFromBackground] to fetch status and progress updates that may have
+  ///     happened while the app was suspended
+  /// [rescheduleKilledTasks] (after a 5 second delay) to ensure tasks that were
+  ///     killed by the user are rescheduled
+  ///
+  /// [doTrackTasks] and [doRescheduleKilledTasks] can be set to false to skip
+  /// that step.  [resumeFromBackground] is always called.
+  Future<void> start(
+      {bool doTrackTasks = true,
+      bool markDownloadedComplete = true,
+      bool doRescheduleKilledTasks = true}) async {
+    if (doTrackTasks) {
+      await FileDownloader()
+          .trackTasks(markDownloadedComplete: markDownloadedComplete);
+      if (doRescheduleKilledTasks) {
+        Timer(const Duration(seconds: 5),
+            () => FileDownloader().rescheduleKilledTasks());
+      }
+    }
+    await FileDownloader().resumeFromBackground();
+  }
 
   /// Activate tracking for tasks in this [group]
   ///
@@ -539,6 +600,65 @@ interface class FileDownloader {
   Future<void> resumeFromBackground() =>
       _downloader.retrieveLocallyStoredData();
 
+  /// Reschedules tasks that are present in the database but missing from
+  /// the native task queue. Typically called on app start, 5s after establishing
+  /// the updates listener, calling [trackTasks] or [trackTasksInGroup] and
+  /// calling [resumeFromBackground].
+  ///
+  /// This function retrieves all tasks from the database that are in enqueued
+  /// or running states and compares these tasks with the
+  /// list of tasks currently present in the native task queue, and all tasks
+  /// that are in waitingToRetry state that are not actually waiting to retry
+  /// in the downloader
+  ///
+  /// For each task found only in the database (or waitingToRetry yet not
+  /// actually waiting), the function:
+  /// 1. Deletes the corresponding record from the database.
+  /// 2. Enqueues the task back into the native task queue.
+  ///
+  /// Finally, the function returns two lists of Tasks in a record. The first
+  /// item is the list of successfully re-enqueued tasks, the second item
+  /// is the list of tasks that failed to enqueue.
+  ///
+  /// Throws assertion error if you are not currently tracking tasks, as that
+  /// makes this function a no-op that always returns empty lists.
+  Future<(List<Task>, List<Task>)> rescheduleKilledTasks() async {
+    assert(
+        _downloader.isTrackingTasks,
+        'rescheduleKilledTasks should only be called if you are tracking tasks. '
+        'Did you call trackTasks or trackTasksInGroup?');
+    final missingTasks = <Task>{};
+    final databaseTasks = await database.allRecords();
+    // find missing enqueued/running tasks
+    final enqueuedOrRunningDatabaseTasks = databaseTasks
+        .where((record) => const [
+              TaskStatus.enqueued,
+              TaskStatus.running,
+            ].contains(record.status))
+        .map((record) => record.task)
+        .toSet();
+    final nativeTasks =
+        Set<Task>.from(await FileDownloader().allTasks(allGroups: true));
+    missingTasks.addAll(enqueuedOrRunningDatabaseTasks.difference(nativeTasks));
+    // find missing tasks waiting to retry
+    missingTasks.addAll(databaseTasks
+        .where((record) =>
+            record.status == TaskStatus.waitingToRetry &&
+            !_downloader.tasksWaitingToRetry.contains(record.task))
+        .map((record) => record.task));
+    final successfullyEnqueued = <Task>[];
+    final failedToEnqueue = <Task>[];
+    for (final task in missingTasks) {
+      await database.deleteRecordWithId(task.taskId);
+      if (await FileDownloader().enqueue(task)) {
+        successfullyEnqueued.add(task);
+      } else {
+        failedToEnqueue.add(task);
+      }
+    }
+    return (successfullyEnqueued, failedToEnqueue);
+  }
+
   /// Returns true if task can be resumed on pause
   ///
   /// This future only completes once the task is running and has received
@@ -561,6 +681,17 @@ interface class FileDownloader {
     return false;
   }
 
+  /// Pauses all tasks, or those in [tasks], or all tasks in group [group]
+  ///
+  /// Returns list of tasks that were paused
+  Future<List<DownloadTask>> pauseAll(
+      {Iterable<DownloadTask>? tasks, String? group}) {
+    for (final taskQueue in _downloader.taskQueues) {
+      taskQueue.pauseAll();
+    }
+    return _downloader.pauseAll(tasks: tasks, group: group);
+  }
+
   /// Resume the task
   ///
   /// If no resume data is available for this task, the call to [resume]
@@ -571,6 +702,37 @@ interface class FileDownloader {
   /// If the task is able to resume, it will, otherwise it will restart the
   /// task from scratch, or fail.
   Future<bool> resume(DownloadTask task) => _downloader.resume(task);
+
+  /// Resume all paused tasks, or those in [tasks], or paused tasks in
+  /// group [group]
+  ///
+  /// Calls to resume will be spaced out over time by [interval], defaults to 50ms
+  Future<List<Task>> resumeAll(
+      {Iterable<DownloadTask>? tasks,
+      String? group,
+      Duration interval = const Duration(milliseconds: 50)}) async {
+    final results = <Task>[];
+    final tasksToResume = switch ((tasks, group)) {
+      (Iterable<DownloadTask> tasks, null) => tasks,
+      (null, String group) => (await _downloader.getPausedTasks())
+          .whereType<DownloadTask>()
+          .where((task) => task.group == group),
+      (null, null) =>
+        (await _downloader.getPausedTasks()).whereType<DownloadTask>(),
+      _ => throw AssertionError(
+          "Either 'tasks' or 'group' must be provided, or neither, but not both.")
+    };
+    for (final task in tasksToResume) {
+      if (await resume(task)) {
+        results.add(task);
+      }
+      await Future.delayed(interval);
+    }
+    for (final taskQueue in _downloader.taskQueues) {
+      taskQueue.resumeAll();
+    }
+    return results;
+  }
 
   /// Set WiFi requirement globally, based on [requirement].
   ///
@@ -595,7 +757,10 @@ interface class FileDownloader {
   /// [running] is the notification used while the task is in progress
   /// [complete] is the notification used when the task completed
   /// [error] is the notification used when something went wrong,
-  /// including pause, failed and notFound status
+  /// including failed and notFound status
+  /// [paused] is the notification shown when the task is paused
+  /// [canceled] is the notification shown when the task is canceled programmatically
+  ///    or by the user via a notification button
   /// [progressBar] if set will show a progress bar
   /// [tapOpensFile] if set will attempt to open the file when the [complete]
   ///     notification is tapped
@@ -633,15 +798,17 @@ interface class FileDownloader {
       TaskNotification? complete,
       TaskNotification? error,
       TaskNotification? paused,
+      TaskNotification? canceled,
       bool progressBar = false,
       bool tapOpensFile = false,
       String groupNotificationId = ''}) {
-    _downloader.notificationConfigs.add(TaskNotificationConfig(
+    _addOrUpdateTaskNotificationConfig(TaskNotificationConfig(
         taskOrGroup: task,
         running: running,
         complete: complete,
         error: error,
         paused: paused,
+        canceled: canceled,
         progressBar: progressBar,
         tapOpensFile: tapOpensFile,
         groupNotificationId: groupNotificationId));
@@ -657,7 +824,10 @@ interface class FileDownloader {
   /// [running] is the notification used while the task is in progress
   /// [complete] is the notification used when the task completed
   /// [error] is the notification used when something went wrong,
-  /// including pause, failed and notFound status
+  /// including failed and notFound status
+  /// [paused] is the notification shown when the task is paused
+  /// [canceled] is the notification shown when the task is canceled programmatically
+  ///    or by the user via a notification button
   /// [progressBar] if set will show a progress bar
   /// [tapOpensFile] if set will attempt to open the file when the [complete]
   ///     notification is tapped
@@ -695,15 +865,17 @@ interface class FileDownloader {
       TaskNotification? complete,
       TaskNotification? error,
       TaskNotification? paused,
+      TaskNotification? canceled,
       bool progressBar = false,
       bool tapOpensFile = false,
       String groupNotificationId = ''}) {
-    _downloader.notificationConfigs.add(TaskNotificationConfig(
+    _addOrUpdateTaskNotificationConfig(TaskNotificationConfig(
         taskOrGroup: group,
         running: running,
         complete: complete,
         error: error,
         paused: paused,
+        canceled: canceled,
         progressBar: progressBar,
         tapOpensFile: tapOpensFile,
         groupNotificationId: groupNotificationId));
@@ -719,7 +891,10 @@ interface class FileDownloader {
   /// [running] is the notification used while the task is in progress
   /// [complete] is the notification used when the task completed
   /// [error] is the notification used when something went wrong,
-  /// including pause, failed and notFound status
+  /// including failed and notFound status
+  /// [paused] is the notification shown when the task is paused
+  /// [canceled] is the notification shown when the task is canceled programmatically
+  ///    or by the user via a notification button
   /// [progressBar] if set will show a progress bar
   /// [tapOpensFile] if set will attempt to open the file when the [complete]
   ///     notification is tapped
@@ -757,19 +932,28 @@ interface class FileDownloader {
       TaskNotification? complete,
       TaskNotification? error,
       TaskNotification? paused,
+      TaskNotification? canceled,
       bool progressBar = false,
       bool tapOpensFile = false,
       String groupNotificationId = ''}) {
-    _downloader.notificationConfigs.add(TaskNotificationConfig(
+    _addOrUpdateTaskNotificationConfig(TaskNotificationConfig(
         taskOrGroup: null,
         running: running,
         complete: complete,
         error: error,
         paused: paused,
+        canceled: canceled,
         progressBar: progressBar,
         tapOpensFile: tapOpensFile,
         groupNotificationId: groupNotificationId));
     return this;
+  }
+
+  /// Helper to add or update a task notification config
+  void _addOrUpdateTaskNotificationConfig(
+      TaskNotificationConfig taskNotificationConfig) {
+    _downloader.notificationConfigs.remove(taskNotificationConfig);
+    _downloader.notificationConfigs.add(taskNotificationConfig);
   }
 
   /// Perform a server request for this [request]
@@ -801,7 +985,7 @@ interface class FileDownloader {
   /// the [mimeType] is not provided we will attempt to derive it from the
   /// [Task.filePath] extension
   ///
-  /// Returns the path to the stored file, or null if not successful
+  /// Returns the path to the stored file, or null if not successful.
   ///
   /// NOTE: on iOS, using [destination] [SharedStorage.images] or
   /// [SharedStorage.video] adds the photo or video file to the Photos
@@ -817,11 +1001,8 @@ interface class FileDownloader {
   ///
   /// Platform-dependent, not consistent across all platforms
   Future<String?> moveToSharedStorage(
-    DownloadTask task,
-    SharedStorage destination, {
-    String directory = '',
-    String? mimeType,
-  }) async =>
+          DownloadTask task, SharedStorage destination,
+          {String directory = '', String? mimeType}) async =>
       moveFileToSharedStorage(await task.filePath(), destination,
           directory: directory, mimeType: mimeType);
 
@@ -831,6 +1012,7 @@ interface class FileDownloader {
   /// [filePath] extension
   ///
   /// Returns the path to the stored file, or null if not successful
+  ///
   /// NOTE: on iOS, using [destination] [SharedStorage.images] or
   /// [SharedStorage.video] adds the photo or video file to the Photos
   /// library. This requires the user to grant permission, and requires the
@@ -845,11 +1027,8 @@ interface class FileDownloader {
   ///
   /// Platform-dependent, not consistent across all platforms
   Future<String?> moveFileToSharedStorage(
-    String filePath,
-    SharedStorage destination, {
-    String directory = '',
-    String? mimeType,
-  }) async =>
+          String filePath, SharedStorage destination,
+          {String directory = '', String? mimeType}) async =>
       _downloader.moveToSharedStorage(
           filePath, destination, directory, mimeType);
 
@@ -927,11 +1106,12 @@ Future<http.Response> _doRequest(
         'POST' => client.post(Uri.parse(request.url),
             headers: request.headers, body: request.post),
         'HEAD' => client.head(Uri.parse(request.url), headers: request.headers),
-        'PUT' => client.put(Uri.parse(request.url), headers: request.headers),
-        'DELETE' =>
-          client.delete(Uri.parse(request.url), headers: request.headers),
-        'PATCH' =>
-          client.patch(Uri.parse(request.url), headers: request.headers),
+        'PUT' => client.put(Uri.parse(request.url),
+            headers: request.headers, body: request.post),
+        'DELETE' => client.delete(Uri.parse(request.url),
+            headers: request.headers, body: request.post),
+        'PATCH' => client.patch(Uri.parse(request.url),
+            headers: request.headers, body: request.post),
         _ => Future.value(response)
       };
       if ([200, 201, 202, 203, 204, 205, 206, 404]

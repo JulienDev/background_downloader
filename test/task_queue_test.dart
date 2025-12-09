@@ -1,4 +1,6 @@
 @Timeout(Duration(minutes: 2))
+library;
+
 // ignore_for_file: avoid_print
 
 import 'dart:math';
@@ -165,7 +167,7 @@ void main() {
       await Future.delayed(const Duration(seconds: 10));
       expect(tq.isEmpty, isFalse);
       expect(tq.waiting.length, greaterThan(0));
-      await Future.delayed(const Duration(seconds: 20));
+      await Future.delayed(const Duration(seconds: 35));
       expect(tq.isEmpty, isTrue);
     });
 
@@ -188,7 +190,7 @@ void main() {
       await Future.delayed(const Duration(seconds: 10));
       expect(tq.isEmpty, isFalse);
       expect(tq.waiting.length, greaterThan(0));
-      await Future.delayed(const Duration(seconds: 20));
+      await Future.delayed(const Duration(seconds: 35));
       expect(tq.isEmpty, isTrue);
     });
   });
@@ -207,7 +209,7 @@ void main() {
         tq.add(task);
       }
       expect(tq.isEmpty, isFalse);
-      await Future.delayed(const Duration(seconds: 10));
+      await Future.delayed(const Duration(seconds: 25));
       expect(tq.isEmpty, isTrue);
       print('$errorCount enqueue errors');
       expect(errorCount, greaterThan(3));

@@ -10,6 +10,8 @@ To upload a file, create an [UploadTask](https://pub.dev/documentation/backgroun
 
 The plugin supports [headers](#headers), [retries](#retries), [priority](#priority), [requiring WiFi](#requiring-wifi) before starting the up/download, user-defined [metadata and display name](#metadata-and-displayname) and GET, [POST](#post-requests) and other http(s) [requests](#http-request-method), and can be [configured](#configuration) by platform. You can [manage  the tasks in the queue](#managing-tasks-and-the-queue) (e.g. cancel, pause and resume), and have different handlers for updates by [group](#grouping-tasks) of tasks. Downloaded files can be moved to [shared storage](#shared-and-scoped-storage) to make them available outside the app.
 
+Pickers for files, photos/videos and directories are included for iOS and Android, and the downloader supports `Uri` based file locations and operations that are consistent across all platforms, including Android's `content://` URIs (used for the Storage Access Framework) and iOSs URL Bookmarks for persistent file locators (see [working with URIs](doc/URI.md)).
+
 No setup is required for [Android](#android) (except when using notifications), Windows and Linux, and only minimal [setup for iOS](#ios) and [MacOS](#macos).
 
 ## Usage examples
@@ -87,12 +89,17 @@ FileDownloader().updates.listen((update) {
       }
     });
 
+FileDownloader().start(); // activates the database and ensures proper restart after suspend/kill
+
 // Next, enqueue tasks to kick off background downloads, e.g.
 final successfullyEnqueued = await FileDownloader().enqueue(DownloadTask(
                                 url: 'https://google.com',
                                 filename: 'google.html',
                                 updates: Updates.statusAndProgress));
+
 ```
+
+**Note:** If you need to enqueue a large number of tasks, create a list of `Task` objects and use `FileDownloader().enqueueAll(tasks)` for better, non-blocking performance.
 
 ### Uploads example
 
@@ -188,6 +195,7 @@ FileDownloader().configureNotification(
   - [Grouping tasks](#grouping-tasks)
   - [Task queues and holding queues](#task-queues-and-holding-queues)
   - [Changing WiFi requirements](#changing-wifi-requirements)
+- [Authentication and pre- and post-execution callbacks](#authentication-and-pre--and-post-execution-callbacks)
 - [Server requests](#server-requests)
 - [Cookies](#cookies)
 - [Optional parameters](#optional-parameters)
@@ -220,7 +228,7 @@ If you want to monitor progress during the download itself (e.g. for a large fil
 final result = await FileDownloader().download(task, 
     onProgress: (progress) => print('Progress update: $progress'));
 ```
-Progress updates start with 0.0 when the actual download starts (which may be in the future, e.g. if waiting for a WiFi connection), and will be sent periodically, not more than twice per second per task.  If a task completes successfully you will receive a final progress update with a `progress` value of 1.0 (`progressComplete`). Failed tasks generate `progress` of `progressFailed` (-1.0), canceled tasks `progressCanceled` (-2.0), notFound tasks `progressNotFound` (-3.0), waitingToRetry tasks `progressWaitingToRetry` (-4.0) and paused tasks `progressPaused` (-5.0).
+Progress updates start with 0.0 when the actual download starts (which may be in the future, e.g. if waiting for a WiFi connection), and will be sent periodically, not more than twice per second per task, and not less than once every 2.5 seconds.  If a task completes successfully you will receive a final progress update with a `progress` value of 1.0 (`progressComplete`). Failed tasks generate `progress` of `progressFailed` (-1.0), canceled tasks `progressCanceled` (-2.0), notFound tasks `progressNotFound` (-3.0), waitingToRetry tasks `progressWaitingToRetry` (-4.0) and paused tasks `progressPaused` (-5.0).
 
 Use `await task.expectedFileSize()` to query the server for the size of the file you are about
 to download.  The expected file size is also included in `TaskProgressUpdate`s that are sent to
@@ -296,7 +304,7 @@ The downloader will only store the file upon success (so there will be no partia
 
 You can also pass an absolute path to the downloader by using `BaseDirectory.root` combined with the path in `directory`. This allows you to reach any file destination on your platform. However, be careful: the reason you should not normally do this (and use e.g. `BaseDirectory.applicationDocuments` instead) is that the location of the app's documents directory may change between application starts (on iOS, and on Android in some cases), and may therefore fail for downloads that complete while the app is suspended.  You should therefore never store permanently, or hard-code, an absolute path, unless you are absolutely sure that that path is 'stable'.
 
-Android has two storage modes: internal (default) and external storage. Read the [configuration document](https://github.com/781flyingdutchman/background_downloader/blob/main/CONFIG.md) for details on how to configure your app to use external storage instead of the default.
+Android has two storage modes: internal (default) and external storage. Read the [configuration document](doc/CONFIG.md) for details on how to configure your app to use external storage instead of the default.
 
 #### Server-suggested filename
 
@@ -314,6 +322,12 @@ final result = await FileDownloader().download(task);
 print('Suggested filename=${result.task.filename}'); // note we don't use 'task', but 'result.task'
 print('Wrong use filename=${task.filename}'); // this will print '?' as 'task' hasn't changed
 ```
+
+#### File, photo/video and directory pickers, and using URIs and the Android Storage Access Framework
+
+The downloader includes file, photo/video and directory pickers for Android and iOS (and for Desktop works alongside the [file_picker](https://pub.dev/packages/file_picker) package) and works well with Android's Storage Access Framework. If you need this functionality, then you should use URIs to locate file/media and directory locations. You use the `FileDownloader().uri` property to work with Uris, and use the associated `UriDownloadTask` and `UriUploadTask` instead of `DownloadTask` and `UploadTask`.
+
+For details, see [working with URIs](doc/URI.md).
 
 ### A batch of files
 
@@ -352,8 +366,10 @@ To ensure your callbacks or listener capture events that may have happened when 
 In summary, to track your tasks persistently, follow these steps in order, immediately after app startup:
 1. If using a non-default `PersistentStorage` backend, initialize with `FileDownloader(persistentStorage: MyPersistentStorage())` and wait for the initialization to complete by calling `await FileDownloader().ready` (see [using the database](#using-the-database-to-track-tasks) for details on `PersistentStorage`).
 2. Register an event listener or callback(s) to process status and progress updates
-3. call `await FileDownloader().trackTasks()` if you want to track the tasks in a persistent database
-4. call `await FileDownloader().resumeFromBackground()` to ensure events that happened while your app was in the background are processed
+3. Call `await FileDownloader().start()` to execute the following calls in the correct order (or call these manually):
+   a. Call `await FileDownloader().trackTasks()` if you want to track the tasks in a persistent database
+   b. Call `await FileDownloader().resumeFromBackground()` to ensure events that happened while your app was in the background are processed
+   c. If you are tracking tasks in the database, after ~5 seconds, call `await FileDownloader().rescheduleKilledTasks()` to reschedule tasks that are in the database as `enqueued` or `running` yet are not enqueued or running on the native side, or that are `waitingToRetry` but not registered as such. These tasks have been "lost", most likely because the user killed your app (which kills tasks on the native side without warning)
 
 The rest of this section details [event listeners](#using-an-event-listener), [callbacks](#using-callbacks) and the [database](#using-the-database-to-track-tasks) in detail.
 
@@ -421,7 +437,7 @@ You can unregister callbacks using `FileDownloader().unregisterCallbacks()`.
 
 ### Using the database to track Tasks
 
-To keep track of the status and progress of all tasks, even after they have completed, activate tracking by calling `trackTasks()` and use the `database` field to query and retrieve the [TaskRecord](https://pub.dev/documentation/background_downloader/latest/background_downloader/TaskRecord-class.html) entries stored. For example:
+To keep track of the status and progress of all tasks, even after they have completed, activate tracking by calling `trackTasks()` (or calling `FileDownloader().start()` with `doTrackTasks` set to true - the default) and use the `database` field to query and retrieve the [TaskRecord](https://pub.dev/documentation/background_downloader/latest/background_downloader/TaskRecord-class.html) entries stored. For example:
 ```dart
 // at app startup, after registering listener or callback, start tracking
 await FileDownloader().trackTasks();
@@ -435,21 +451,23 @@ final successfullyEnqueued = await FileDownloader().enqueue(task);
 // somewhere else: query the task status by getting a `TaskRecord`
 // from the database
 final record = await FileDownloader().database.recordForId(task.taskId);
-print('Taskid ${record.taskId} with task ${record.task} has '
+print('TaskId ${record.taskId} with task ${record.task} has '
     'status ${record.status} and progress ${record.progress} '
     'with an expected file size of ${record.expectedFileSize} bytes'
 ```
 
 You can interact with the `database` using `allRecords`, `allRecordsOlderThan`, `recordForId`,`deleteAllRecords`,
-`deleteRecordWithId` etc. If you only want to track tasks in a specific [group](#grouping-tasks), call `trackTasksInGroup` instead.
+`deleteRecordWithId` etc. If you only want to track tasks in a specific [group](#grouping-tasks), call `trackTasksInGroup` instead. 
+To listen to changes to the database, use the `FileDownloader().database.updates` stream of `TaskRecord` items, emitted after a record has been updated in the database. This is a `BroadcastStream`, so multiple listeners can attach/detach and re-attach to the stream, which makes it easy to use in UI components. Make sure to cancel your `StreamSubscription` appropriately.
+
+If a user kills your app (e.g. by swiping it away in the app tray) then tasks that are running (natively) are killed, and no indication is given to your application. This cannot be avoided. To guard for this, upon app startup you can ask the downloader to reschedule killed tasks, i.e. tasks that show up as `enqueued` or `running` in the database, yet are not enqueued or running on the native side, or are `waitingToRetry` but not registered as such. Method `rescheduleKilledTasks` returns a record with two lists, 1) successfully rescheduled tasks and 2) tasks that failed to reschedule. Together, those are the missing tasks. Reschedule missing tasks a few seconds after you have called `resumeFromBackground`, as that gives the downloader time to processes updates that may have happened while the app was suspended, or call `FileDownloader().start()` with `doRescheduleKilledTasks` set to true (the default).
 
 By default, the downloader uses a modified version of the [localstore](https://pub.dev/packages/localstore) package to store the `TaskRecord` and other objects. To use a different persistent storage solution, create a class that implements the [PersistentStorage](https://pub.dev/documentation/background_downloader/latest/background_downloader/PersistentStorage-class.html) interface, and initialize the downloader by calling `FileDownloader(persistentStorage: MyPersistentStorage())` as the first use of the `FileDownloader`.
 
 As an alternative to LocalStore, use `SqlitePersistentStorage`, included in [background_downloader_sql](https://pub.dev/packages/background_downloader_sql), which supports SQLite storage and migration from Flutter Downloader.
 
-
 ## Notifications
-
+Pub
 On iOS and Android, for downloads and uploads, the downloader can generate notifications to keep the user informed of progress also when the app is in the background, and allow pause/resume and cancellation of an ongoing download from those notifications.
 
 Configure notifications by calling `FileDownloader().configureNotification` and supply a
@@ -463,8 +481,7 @@ FileDownloader().configureNotification(
     progressBar: true);
 ```
 
-To also show a notifications for other states, add a `TaskNotification` for `complete`, `error`
-and/or `paused`. If `paused` is configured and the task can be paused, a 'Pause' button will
+To also show a notifications for other states, add a `TaskNotification` for `complete`, `error`, `paused` and/or `canceled`. If `paused` is configured and the task can be paused, a 'Pause' button will
 show for the `running` notification, next to the 'Cancel' button. To open the downloaded file
 when the user taps the `complete` notification, add `tapOpensFile: true` to your call to
 `configureNotification`
@@ -491,7 +508,7 @@ Make sure to check for, and if necessary request, permission to display notifica
 
 If you download or upload multiple files simultaneously, you may not want a notification for every task, but one notification representing the group of tasks.  To do this, set the `groupNotificationId` field in a `notificationConfig` and use that configuration for all tasks in this group. It is easiest to combine this with the `group` field of the task, e.g.:
 ```dart
-FileDownloader.configureNotificationForGroup('bunchOfFiles', // refers to the Task.group field
+FileDownloader().configureNotificationForGroup('bunchOfFiles', // refers to the Task.group field
             running: const TaskNotification(
                 '{numFinished} out of {numTotal}', 'Progress = {progress}'),
             complete:
@@ -508,7 +525,7 @@ await FileDownloader().enqueue(DownloadTask(
             group: 'bunchOfFiles'));
 ```
 
-All tasks in group `bunchOfFiles` will now use the notification group configuration with ID `myNotificationGroup`. Any other task that uses a configuration with `groupNotificationId` set to 'myGroupNotification' will also be added to that group notification.
+All tasks in group `bunchOfFiles` will now use the notification group configuration with ID `myNotificationGroup`. Any other task that uses a configuration with `groupNotificationId` set to 'myGroupNotification' will also be added to that group notification. Notification tap detection is not implemented for notification groups.
 
 __On iOS__: If your `running` group notification contains a dynamic item (such as `{numFinished}` in the example above) then a new notification will be issued every time the notification message changes (different from Android, where the existing notification is updated so does not trigger a new one).
 
@@ -538,7 +555,7 @@ register a `taskNotificationTapCallback`.
 
 ### Setup for notifications
 
-On iOS, add the following to your `AppDelegate.swift`:
+__On iOS__: Add the following to your `AppDelegate.swift`:
 ```swift
 UNUserNotificationCenter.current().delegate = self as UNUserNotificationCenterDelegate
 ```
@@ -547,6 +564,9 @@ or if using Objective C, add to `AppDelegate.m`:
 [UNUserNotificationCenter currentNotificationCenter].delegate = (id<UNUserNotificationCenterDelegate>) self;
 ```
 
+__On Android__: Starting with API 33, you need to add `<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />` to your app's `AndroidManifest.xml`
+
+If needed, localize the button text by overriding string resources `bg_downloader_cancel`, `bg_downloader_pause`, `bg_downloader_resume` and descriptions `bg_downloader_notification_channel_name`, `bg_downloader_notification_channel_description`. Optionally, supply your own notification icons by creating a version of the icons defined in `android/src/main/res/drawable`, e.g. `outline_download_done_24.xml`, and add those to your own app's `android/src/main/res/drawable` under the same name.
 
 ## Shared and scoped storage
 
@@ -684,11 +704,20 @@ Uploads are very similar to downloads, except:
 
 There are two ways to upload a file to a server: binary upload (where the file is included in the POST body) and form/multi-part upload. Which type of upload is appropriate depends on the server you are uploading to. The upload will be done using the binary upload method only if you have set the `post` field of the `UploadTask` to 'binary'.
 
+For binary uploads, the `Content-Disposition` header sent to the server will be:
+- set to 'attachment = "filename"' if the task.headers field does not contain an entry for 'Content-Disposition' (with 'filename' replaced by the actual filename)
+- not set at all (i.e. omitted) if the task.headers field contains an entry for 'Content-Disposition' with the value '' (an empty string)
+- set to the value of `task.headers['Content-Disposition']` in all other cases
+
+### Single file upload
+
 If you already have a `File` object, you can create your `UploadTask` using `UploadTask.fromFile`, though note that this will create a task with an absolute path reference and `BaseDirectory.root`, which can cause problems on mobile platforms (see [here](#specifying-the-location-of-the-file-to-download-or-upload)). Preferably, use `Task.split` to break your `File` or filePath into appropriate baseDirectory, directory and filename and use that to create your `UploadTask`.
 
 For multi-part uploads you can specify name/value pairs in the `fields` property of the `UploadTask` as a `Map<String, String>`. These will be uploaded as form fields along with the file. To specify multiple values for a single name, format the value as `'"value1", "value2", "value3"'` (note the double quotes and the comma to separate the values).
 
 You can also set the field name used for the file itself by setting `fileField` (default is "file") and override the mimeType by setting `mimeType` (default is derived from filename extension).
+
+### Multiple file upload
 
 If you need to upload multiple files in a single request, create a [MultiUploadTask](https://pub.dev/documentation/background_downloader/latest/background_downloader/MultiUploadTask-class.html) instead of an `UploadTask`. It has similar parameters as the `UploadTask`, except you specify a list of files to upload as the `files` argument of the constructor, and do not use `fileName`, `fileField` and `mimeType`. Each element in the `files` list is either:
 * a filename (e.g. `"file1.txt"`). The `fileField` for that file will be set to the base name (i.e. "file1" for "file1.txt") and the mime type will be derived from the extension (i.e. "text/plain" for "file1.txt")
@@ -696,15 +725,22 @@ If you need to upload multiple files in a single request, create a [MultiUploadT
 * a record containing `(filefield, filename, mimeType)`, e.g. `("document", "file1.txt", "text/plain")`
 
 The `baseDirectory` and `directory` fields of the `MultiUploadTask` determine the expected location of the file referenced, unless the filename used in any of the 3 formats above is an absolute path (e.g. "/data/user/0/com.my_app/file1.txt"). In that case, the absolute path is used and the `baseDirectory` and `directory` fields are ignored for that element of the list.
+
+If you are using URIs to locate your files (see [working with URIs](doc/URI.md)) then you can replace the `filename` with the Uri (as `Uri` type, not `String`) in each of the formats mentioned above.
+
 Once the `MultiUpoadTask` is created, the fields `fileFields`, `filenames` and `mimeTypes` will contain the parsed items, and the fields `fileField`, `filename` and `mimeType` contain those lists encoded as a JSON string.
 
 Use the `MultiTaskUpload` object in the `upload` and `enqueue` methods as you would a regular `UploadTask`.
+
+For partial uploads, set the byte range by adding a "Range" header to your binary `UploadTask`, e.g. a value of "bytes=100-149" will upload 50 bytes starting at byte 100. You can omit the range end (but not the "-") to upload from the indicated start byte to the end of the file.  The "Range" header will not be passed on to the server. Note that on iOS an invalid range will cause enqueue to fail, whereas on Android and Desktop the task will fail when attempting to start.
 
 ## Parallel downloads
 
 Some servers may offer an option to download part of the same file from multiple URLs or have multiple parallel downloads of part of a large file using a single URL. This can speed up the download of large files.  To do this, create a `ParallelDownloadTask` instead of a regular `DownloadTask` and specify `chunks` (the number of pieces you want to break the file into, i.e. the number of downloads that will happen in parallel) and `urls` (as a list of URLs, or just one). For example, if you specify 4 chunks and 2 URLs, then the download will be broken into 8 pieces, four each for each URL.
 
 Note that the implementation of this feature creates a regular `DownloadTask` for each chunk, with the group name 'chunk' which is now a reserved group. You will not get updates for this group, but you will get normal updates (status and/or progress) for the `ParallelDownloadTask`.
+
+Parallel downloads do not support the use of URIs.
 
 ## Managing tasks and the queue
 
@@ -713,10 +749,14 @@ Note that the implementation of this feature creates a regular `DownloadTask` fo
 To enable pausing, set the `allowPause` field of the `Task` to `true`. This may also cause the task to `pause` un-commanded. For example, the OS may choose to pause the task if someone walks out of WiFi coverage.
 
 To cancel, pause or resume a task, call:
+* `cancel` to cancel a task
+* `cancelAll` to cancel all tasks currently running, a specific list of tasks, or all tasks in a `group`.
 * `cancelTaskWithId` to cancel the tasks with that taskId
 * `cancelTasksWithIds` to cancel all tasks with a `taskId` in the provided list of taskIds
 * `pause` to attempt to pause a task. Pausing is only possible for download GET requests, only if the `Task.allowPause` field is true, and only if the server supports pause/resume. Soon after the task is running (`TaskStatus.running`) you can call `taskCanResume` which will return a Future that resolves to `true` if the server appears capable of pause & resume. If it is not, then `pause` will have no effect and return false
+* `pauseAll` to attempt to pause a all tasks currently running, a specific list of tasks, or all tasks in a `group`. Returns a list of tasks that were paused
 * `resume` to resume a previously paused task (or certain failed tasks), which returns true if resume appears feasible. The task status will follow the same sequence as a newly enqueued task. If resuming turns out to be not feasible (e.g. the operating system deleted the temp file with the partial download) then the task will either restart as a normal download, or fail.
+* `resumeAll` to resume all tasks currently paused, a specific list of tasks, or all tasks in a `group`. Returns a list of tasks that were resumed
 
 
 To manage or query the queue of waiting or running tasks, call:
@@ -727,6 +767,7 @@ To manage or query the queue of waiting or running tasks, call:
 * `tasksFinished` to check if all tasks have finished (successfully or otherwise)
 
 Each of these methods accept a `group` parameter that targets the method to a specific group. If tasks are enqueued with a `group` other than default, calling any of these methods without a group parameter will not affect/include those tasks - only the default tasks.
+Methods `allTasks` and `allTaskId` return all tasks regardless of group if argument `allGroups` is set to `true`.
 
 **NOTE:** Only tasks that are active (ie. not in a final state) are guaranteed to be returned or counted, but returning a task does not guarantee that it is active.
 This means that if you check `tasksFinished` when processing a task update, the task you received an update for may still show as 'active', even though it just finished, and result in `false` being returned. To fix this, pass that task's taskId as `ignoreTaskId` to the `tasksFinished` call, and it will be ignored for the purpose of testing if all tasks are finished: 
@@ -778,7 +819,7 @@ final tq = MemoryTaskQueue();
 tq.maxConcurrent = 5; // no more than 5 tasks active at any one time
 tq.maxConcurrentByHost = 2; // no more than two tasks talking to the same host at the same time
 tq.maxConcurrentByGroup = 3; // no more than three tasks from the same group active at the same time
-FileDownloader().add(tq); // 'connects' the TaskQueue to the FileDownloader
+FileDownloader().addTaskQueue(tq); // 'connects' the TaskQueue to the FileDownloader
 FileDownloader().updates.listen((update) { // listen to updates as per usual
   print('Received update for ${update.task.taskId}: $update')
 });
@@ -790,7 +831,7 @@ for (var n = 0; n < 100; n++) {
 
 Because it is possible that an error occurs when the taskQueue eventually actually enqueues the task with the FileDownloader, you can listen to the `enqueueErrors` stream for tasks that failed to enqueue.
 
-A common use for the `MemoryTaskQueue` is enqueueing a large number of tasks. This can 'choke' the downloader if done in a loop, but is easy to do when adding all tasks to a queue. The `minInterval` field of the `MemoryTaskQueue` ensures that the tasks are fed to the `FileDownloader` at a rate that does not grind your app to a halt.
+Before the introduction of `enqueueAll`, a common use for the `TaskQueue` was enqueueing a large number of tasks without 'choking' the downloader if done in a loop. The current recommended method for that scenario is to use `enqueuAll`, though the `TaskQueue` can be used if not all tasks are available at the time of enqueue.  Use property `minInterval` to pace the rate at which tasks are enqueued using the `TaskQueue`. 
 
 The default `TaskQueue` is the `MemoryTaskQueue` which, as the  name suggests, keeps everything in memory. This is fine for most situations, but be aware that the queue may get dropped if the OS aggressively moves the app to the background. Tasks still waiting in the queue will not be enqueued, and will therefore be lost. If you want a `TaskQueue` with more persistence, or add different prioritization and concurrency roles, then subclass the `MemoryTaskQueue` and add your own persistence or logic.
 In addition, if your app is suspended by the OS due to resource constraints, tasks waiting in the queue will not be enqueued to the native platform and will not run in the background. TaskQueues are therefore best for situations where you expect the queue to be emptied while the app is still in the foreground.
@@ -815,6 +856,84 @@ By default, whether a task requires WiFi or not is determined by its `requireWiF
 When calling `FileDownloader().requireWifi`, all enqueued tasks will be canceled and rescheduled with the appropriate WiFi requirement setting, and if the `rescheduleRunningTasks` parameter is true, all running tasks will be paused (if possible, independent of the task's `allowPause` property) or canceled and resumed/restarted with the new WiFi requirement. All newly enqueued tasks will follow this setting as well.
 
 The global setting persists across application restarts. Check the current setting by calling `FileDownloader().getRequireWiFiSetting`.
+
+## Authentication and pre- and post-execution callbacks
+
+A task may be waiting a long time before it gets executed, or before it has finished, and you may need to modify the task before it actually starts (e.g. to refresh an access token) or do something when it finishes (e.g. conditionally call your server to confirm an upload has finished). The normal listener or registered callback approach does not enable that functionality, and does not execute when the app is in a suspended state.
+
+To facilitate more complex task management functions, consider using "native" callbacks:
+* `beforeTaskStart`: a callback called before a task starts executing. The callback receives the `Task` and returns `null` if the task should continue, or a `TaskStatusUpdate` if it should not start - in which case the `TaskStatusUpdate` is posted as the last state update for the task
+* `onTaskStart`: a callback called before a task starts executing, after `beforeTaskStart`. The callback receives the `Task` and returns `null` if it did not change anything, or a modified `Task` if it needs to use a different url or header. It is called after `onAuth` for token refresh, if that is set
+* `onTaskFinished`: a callback called when the task has finished. The callback receives the final `TaskStatusUpdate`.
+* `auth`: a class that facilitates management of authorization tokens and refresh tokens, and includes an `onAuth` callback similar to `onTaskStart`
+
+To add a callback to a `Task`, set its `options` property, e.g. to add an onTaskStart callback:
+```dart
+final task = DownloadTask(url: 'https://google.com',
+   options: TaskOptions(onTaskStart: myStartCallback));
+```
+where `myStartCallback` must be a top level or static function, and must be annotated with `@pragma("vm:entry-point")` to ensure it can be called from native code.
+
+For most situations, using the event listeners or registered "regular" callbacks is recommended, as they run in the normal application context on the main isolate. Native callbacks are called directly from native code (iOS, Android or Desktop) and therefore behave differently:
+* Native callbacks are called even when an application is suspended
+* On iOS, the callbacks runs in the main isolate
+* On Android, callbacks run in a shared background isolate, though there is no guarantee that every callback shares the same isolate as another callback
+* On Desktop, callbacks run in the same isolate as the task, and every task has its own isolate
+
+You should assume that the callback runs in an isolate, and has no access to application state or to plugins. Native callbacks are really only meant to perform simple "local" functions, operating only on the parameter passed into the callback function.
+
+### BeforeTaskStart
+Callback with signature `Future<TaskStatusUpdate?> Function(Task task)`, called just before the task starts executing. Your callback receives the `task` and should return `null` if the task should proceed. If the task should end before it is started, return a `TaskStatusUpdate` object, which will be returned. The `TaskStatusUpdate` object must be consistent with normal updates of that type, e.g. an update with `status` set to `.canceled` cannot contain an `exception` or `responseStatusCode`. 
+
+### OnTaskStart
+Callback with signature`Future<Task?> Function(Task original)`, called just before the task starts executing, immediately after `BeforeTaskStart`. Your callback receives the `original` task about to start, and can modify this task if necessary. If you make modifications, you return the modified task - otherwise return null to continue execution with the original task. You can only change the task's `url` (including query parameters) and `headers` properties - making changes to any other property may lead to undefined behavior.
+
+### OnTaskFinished
+Callback with signature `Future<void> Function(TaskStatusUpdate taskStatusUpdate)`, called when the task has reached a final state (regardless of outcome). Your callback receives the final `TaskStatusUpdate` and can act on that.
+
+### Authorization
+
+The `Auth` object (which can be set as the `auth` property in `TaskOptions`) contains several properties that can optionally be set:
+* `accessToken`: the token created by your auth mechanism to provide access.  It is typically passed as part of a request in the `Authorization` header, but different mechanisms exist
+* `accessHeaders`: the headers specific to authorization. In these headers, the template `{accessToken}` will be replaced by the actual `accessToken` property, so a common value would be `{'Authorization': 'Bearer {accessToken}'`
+* `accessQueryParams`: the query parameters specific to authorization. In these headers, the template `{accessToken}` will be replaced by the actual `accessToken` property
+* `accessTokenExpiryTime`: the time at which the `accessToken` will expire.
+* `refreshToken`, `refreshHeaders` and `refreshQueryParams` are similar to those for access (the template `{refreshToken}` will be replaced with the actual `refreshToken`)
+* `refreshUrl`: url to use for refresh, including query parameters not related to the auth tokens
+* `onAuth`: callback that will be called when token refresh is required
+
+The downloader uses the `auth` object on the native side as follows:
+* Just before the task starts, we check the `accessTokenExpiryTime`
+* If it is close to this time, the downloader will call the `onAuth` callback (your code) to refresh the access token
+  - A `defaultOnAuth` function is included that calls `auth.refreshAccessToken` using a common approach, but use your own `onAuth` callback if your auth mechanism differs
+  - The `Task` returned by the `onAuth` call can change the `Auth` object itself (e.g. replace the `accessToken` with a refreshed one) and those values will be used to construct the task's request
+* The `Task` request is built as follows:
+  - Start with the headers and query parameters of the original task. You should have all headers and query parameters that are not related to authentication here
+  - Add or replace every header and query parameter from the `accessHeaders` and `accessQueryParams` to the task's headers and query parameters, substituting the templates for `accessToken` and `refreshToken`
+  - Construct the task's server request using these merged headers and query parameters
+
+A typical way to construct a task with authorization and default `onAuth` refresh approach then is:
+```dart
+final auth = Auth(
+    accessToken: 'initialAccessToken',
+    accessHeaders: {'Authorization': 'Bearer {accessToken}'},
+    refreshToken: 'initialRefreshToken',
+    refreshUrl: 'https://your.server/refresh_endpoint',
+    accessTokenExpiryTime: DateTime.now()
+            .add(const Duration(minutes: 10)), // typically extracted from token
+    onAuth: defaultOnAuth // to use typical default callback
+);
+final task = DownloadTask(
+    url: 'https://your.server/download_endpoint',
+    urlQueryParameters: {'param1': 'value1'},
+    headers: {'Header1': 'value2'},
+    filename: 'my_file.txt',
+    options: TaskOptions(auth: auth));
+```
+
+There are limitations to the auth functionality, as the original task is not updated on the Dart side. For example, if a token refresh was performed and subsequently the task is paused, the resumed task with have the original accessToken and expiry time and will therefore trigger another token refresh.
+
+__NOTE:__ The callback functionality is experimental for now, and its behavior may change without warning in future updates. Please provide feedback on callbacks.
 
 ## Server requests
 
@@ -930,9 +1049,21 @@ No setup is required for Windows or Linux.
 
 ### Android
 
-No setup is required if you don't use notifications. If you do:
-* Starting with API 33, you need to add `<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />` to your app's `AndroidManifest.xml`
-* If needed, localize the button text by overriding string resources `bg_downloader_cancel`, `bg_downloader_pause`, `bg_downloader_resume` and descriptions `bg_downloader_notification_channel_name`, `bg_downloader_notification_channel_description`.
+This package needs Kotlin 1.9.20 or above to compile.
+For modern Flutter projects this should be added to the `/android/settings.gradle` file.
+```gradle
+plugins {
+    // ...
+    id "org.jetbrains.kotlin.android" version "1.9.20" apply false
+    // ...
+}
+```
+For older flutter projects, the kotlin version is set in the `android/build.gradle` file as follows.
+```gradle
+buildScript {
+    ext.kotlin_version = '1.9.20'
+}
+```
 
 ### iOS
 
@@ -944,16 +1075,6 @@ On iOS, ensure that you have the Background Fetch capability enabled:
 * Tick the 'Background Fetch' mode
 
 Note that iOS by default requires all URLs to be https (and not http). See [here](https://developer.apple.com/documentation/security/preventing_insecure_network_connections) for more details and how to address issues.
-
-If using notifications, add the following to your `AppDelegate.swift`:
-```swift
-UNUserNotificationCenter.current().delegate = self as UNUserNotificationCenterDelegate
-```
-or if using Objective C, add to `AppDelegate.m`:
-```objective-c
-[UNUserNotificationCenter currentNotificationCenter].delegate = (id<UNUserNotificationCenterDelegate>) self;
-```
-
 
 ### MacOS
 
@@ -970,6 +1091,7 @@ Then do the same thing in macos/Runner/Release.entitlements.
 Several aspects of the downloader can be configured on startup:
 * Setting the request timeout value and, for iOS only, the 'resourceTimeout'
 * Checking available space before attempting a download
+* Skipping file download if the destination file already exists
 * Activating a holding queue to manage how many tasks are executed concurrently
 * On Android, when to use the `cacheDir` for temporary files
 * Setting a proxy
@@ -978,11 +1100,11 @@ Several aspects of the downloader can be configured on startup:
 * On Android, whether or not to use external storage
 * On iOS, localizing the notification button texts
 
-Please read the [configuration document](https://github.com/781flyingdutchman/background_downloader/blob/main/CONFIG.md) for details on how to configure.
+Please read the [configuration document](doc/CONFIG.md) for details on how to configure.
 
 ## Limitations
 
-* iOS 13.0 or greater; Android API 21 or greater
+* iOS 14.0 or greater; Android API 21 or greater
 * On Android, downloads are by default limited to 9 minutes, after which the download will end with `TaskStatus.failed`. To allow for longer downloads, set the `DownloadTask.allowPause` field to true: if the task times out, it will pause and automatically resume, eventually downloading the entire file. Alternatively, [configure](#configuration) the downloader to allow tasks to run in the foreground
 * On iOS, once enqueued (i.e. `TaskStatus.enqueued`), a background download must complete within 4 hours. [Configure](#configuration) 'resourceTimeout' to adjust.
 * Redirects will be followed
