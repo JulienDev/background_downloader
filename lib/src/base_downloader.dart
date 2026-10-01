@@ -458,8 +458,22 @@ abstract base class BaseDownloader {
         .map((task) => task.taskId)
         .toList(growable: false);
     // remove tasks waiting to retry from the list so they won't be retried
+    tasksWaitingToRetry.removeAll(matchingTasksWaitingToRetry);
     for (final task in matchingTasksWaitingToRetry) {
-      tasksWaitingToRetry.remove(task);
+      if (!Platform.isIOS && task is DownloadTask && isRangeResumeTask(task)) {
+        // No native runner owns this waiting task. Delete its retained prefix
+        // before the canceled status clears the associated ResumeData.
+        final resumeData = await getResumeData(task.taskId);
+        if (resumeData != null) {
+          try {
+            await File(resumeData.tempFilepath).delete();
+          } on FileSystemException catch (error) {
+            log.fine(
+              'Could not delete canceled range file ${resumeData.tempFilepath}: $error',
+            );
+          }
+        }
+      }
       processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
       processProgressUpdate(TaskProgressUpdate(task, progressCanceled));
       updateNotification(task, null); // remove notification
@@ -467,11 +481,17 @@ abstract base class BaseDownloader {
     final remainingTaskIds = taskIds.where(
       (taskId) => !matchingTaskIdsWaitingToRetry.contains(taskId),
     );
-    // cancel paused tasks
+    // cancel paused tasks. Local patch: iOS range parents keep their bytes
+    // natively, so the platform cancels them, paused or not.
     final pausedTasks = await getPausedTasks();
     final pausedTaskIdsToCancel = pausedTasks
-        .where((task) => remainingTaskIds.contains(task.taskId))
-        .map((e) => e.taskId);
+        .where(
+          (task) =>
+              remainingTaskIds.contains(task.taskId) &&
+              !isRangeChunksTask(task),
+        )
+        .map((e) => e.taskId)
+        .toList(growable: false);
     await cancelPausedPlatformTasksWithIds(pausedTasks, pausedTaskIdsToCancel);
     // cancel remaining taskIds on the platform
     final platformTaskIds = remainingTaskIds
@@ -480,7 +500,34 @@ abstract base class BaseDownloader {
     if (platformTaskIds.isEmpty) {
       return true;
     }
-    return cancelPlatformTasksWithIds(platformTaskIds);
+    // Cancel first: awaiting before this would let queued tasks be admitted.
+    final result = await cancelPlatformTasksWithIds(platformTaskIds);
+    // Local patch: a failed Android/desktop range download kept its partial
+    // file for a retry; no runner owns it, so delete it here.
+    for (final taskId in platformTaskIds) {
+      final resumeData = await getResumeData(taskId);
+      if (resumeData == null || !isRangeResumeTask(resumeData.task)) continue;
+      final record = await database.recordForId(taskId);
+      if (record?.status != TaskStatus.failed &&
+          record?.status != TaskStatus.notFound) {
+        continue;
+      }
+      try {
+        await File(resumeData.tempFilepath).delete();
+      } on FileSystemException catch (error) {
+        log.fine(
+          'Could not delete retained range file ${resumeData.tempFilepath}: $error',
+        );
+      }
+      processStatusUpdate(
+        TaskStatusUpdate(resumeData.task, TaskStatus.canceled),
+      );
+      processProgressUpdate(
+        TaskProgressUpdate(resumeData.task, progressCanceled),
+      );
+      updateNotification(resumeData.task, null);
+    }
+    return result;
   }
 
   /// Cancels all tasks, or those in [tasks], or all tasks in group [group]
@@ -710,8 +757,37 @@ abstract base class BaseDownloader {
   }
 
   /// Stores the resume data
-  Future<void> setResumeData(ResumeData resumeData) =>
-      _storage.storeResumeData(resumeData);
+  Future<void> setResumeData(ResumeData resumeData) {
+    if (isRangeResumeTask(resumeData.task)) {
+      _rangeResumeOffsets[resumeData.taskId] = resumeData.requiredStartByte;
+    }
+    return _storage.storeResumeData(resumeData);
+  }
+
+  /// Retained offsets of marked range tasks, from their latest resume data.
+  final _rangeResumeOffsets = <String, int>{};
+
+  /// Retained offset of each marked range task at its previous failure.
+  final _rangeFailureOffsets = <String, int>{};
+
+  /// A marked range task that made progress since its previous failure gets
+  /// its full retry budget back: only consecutive failures at the same offset
+  /// exhaust it, so long downloads survive any number of separate cuts.
+  void _refillRangeRetries(Task task) {
+    if (!isRangeResumeTask(task)) {
+      return;
+    }
+    final offset = _rangeResumeOffsets[task.taskId] ?? 0;
+    final previous = _rangeFailureOffsets[task.taskId];
+    _rangeFailureOffsets[task.taskId] = offset;
+    if (previous != null && offset > previous) {
+      log.fine(
+        'TaskId ${task.taskId} progressed from $previous to $offset bytes; '
+        'restoring ${task.retries} retries',
+      );
+      task.retriesRemaining = task.retries;
+    }
+  }
 
   /// Retrieve the resume data for this [taskId]
   Future<ResumeData?> getResumeData(String taskId) =>
@@ -832,6 +908,14 @@ abstract base class BaseDownloader {
     // has retriesRemaining > 0: those are always sent here, and are
     // intercepted to hold the task and reschedule in the near future
     final task = update.task;
+    if (update.status == TaskStatus.failed) {
+      _refillRangeRetries(task);
+    }
+    if (update.status.isFinalState &&
+        !(update.status == TaskStatus.failed && task.retriesRemaining > 0)) {
+      _rangeResumeOffsets.remove(task.taskId);
+      _rangeFailureOffsets.remove(task.taskId);
+    }
     if (update.status == TaskStatus.failed && task.retriesRemaining > 0) {
       _emitStatusUpdate(TaskStatusUpdate(task, TaskStatus.waitingToRetry));
       _emitProgressUpdate(TaskProgressUpdate(task, progressWaitingToRetry));
@@ -874,7 +958,18 @@ abstract base class BaseDownloader {
         setPausedTask(task);
       }
       if (update.status.isFinalState) {
-        _clearPauseResumeInfo(task);
+        if (_keepsRangeResumeData(update)) {
+          // Local patch: a failed range download keeps its retained bytes and
+          // ResumeData, so a user retry (resume) continues from them; cancel
+          // deletes them.
+          canResumeTask.remove(task);
+          removePausedTask(task.taskId);
+          if (isRangeResumeTask(task)) {
+            unawaited(_dropMissingRangePrefix(task));
+          }
+        } else {
+          _clearPauseResumeInfo(task);
+        }
       }
       if (update.status.isFinalState || update.status == TaskStatus.paused) {
         notifyTaskQueues(task);
@@ -1084,10 +1179,14 @@ abstract base class BaseDownloader {
     TaskException? taskException,
   ) async {
     if (trackedGroups.contains(null) || trackedGroups.contains(task.group)) {
+      // Both range kinds keep their displayed progress across retries/resumes.
+      final rangeResume = isRangeResumeTask(task) || isRangeChunksTask(task);
       if (status == null && progress != null) {
         // update existing record with progress only (provided it's not 'paused')
         final existingRecord = await database.recordForId(task.taskId);
-        if (existingRecord != null && progress != progressPaused) {
+        if (existingRecord != null &&
+            progress != progressPaused &&
+            !(rangeResume && progress == progressWaitingToRetry)) {
           await database.updateRecord(
             existingRecord.copyWith(progress: progress),
           );
@@ -1105,6 +1204,22 @@ abstract base class BaseDownloader {
           TaskStatus.waitingToRetry => progressWaitingToRetry,
           TaskStatus.paused => progressPaused,
         };
+        if (rangeResume &&
+            (status == TaskStatus.enqueued ||
+                status == TaskStatus.running ||
+                status == TaskStatus.waitingToRetry)) {
+          // Preserve displayed bytes across a retry. A fresh attempt still
+          // emits an explicit zero progress update when no prefix survives.
+          final existingRecord = await database.recordForId(task.taskId);
+          if (existingRecord != null &&
+              existingRecord.progress >= 0 &&
+              existingRecord.progress < 1) {
+            progress = existingRecord.progress;
+            if (expectedFileSize == -1) {
+              expectedFileSize = existingRecord.expectedFileSize;
+            }
+          }
+        }
       }
       if (status != TaskStatus.paused) {
         await database.updateRecord(
@@ -1123,6 +1238,37 @@ abstract base class BaseDownloader {
           ),
         );
       }
+    }
+  }
+
+  /// Forgets kept ResumeData whose prefix the platform deleted (a final
+  /// response that contradicted it), so the task no longer claims to resume.
+  Future<void> _dropMissingRangePrefix(Task task) async {
+    final resumeData = await getResumeData(task.taskId);
+    if (resumeData != null && !await File(resumeData.tempFilepath).exists()) {
+      await removeResumeData(task.taskId);
+    }
+  }
+
+  bool _keepsRangeResumeData(TaskStatusUpdate update) =>
+      (update.status == TaskStatus.failed ||
+          update.status == TaskStatus.notFound) &&
+      (isRangeResumeTask(update.task) || isRangeChunksTask(update.task));
+
+  /// Local patch: drops native range downloads whose tasks are not in
+  /// [taskIds]; only the iOS native downloader keeps such downloads.
+  Future<void> retainRangeDownloads(Iterable<String> taskIds) async {}
+
+  /// Local patch: true for an Android/desktop task marked after a Range probe.
+  bool isRangeResumeTask(Task task) {
+    try {
+      final metadata = jsonDecode(task.metaData);
+      return metadata is Map &&
+          metadata['rangeResume'] == true &&
+          (int.tryParse('${metadata['rangeTotal']}') ?? 0) > 0;
+    } on FormatException {
+      // Unmarked metadata can be any string.
+      return false;
     }
   }
 

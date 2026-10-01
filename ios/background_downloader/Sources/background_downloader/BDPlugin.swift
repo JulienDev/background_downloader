@@ -72,6 +72,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         }
         UriUtilsMethodCallHelper.register(with: registrar) // not a real plugin, but has a methodCallHandler
         requireWiFi = RequireWiFi(rawValue: UserDefaults.standard.integer(forKey: BDPlugin.keyRequireWiFi))!
+        installRangeDownloader()
     }
     
     @objc
@@ -155,6 +156,10 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
                 methodForceFailPostOnBackgroundChannel(call: call, result: result)
             case "testSuggestedFilename":
                 methodTestSuggestedFilename(call: call, result: result)
+            case "retainRangeDownloads":
+                // Local patch: drop native range downloads Dart no longer tracks.
+                RangeDownloader.shared.retainOnly(parentTaskIds: Set(call.arguments as? [String] ?? []))
+                result(true)
             default:
                 os_log("Invalid method: %@", log: log, type: .error, call.method)
                 result(FlutterMethodNotImplemented)
@@ -306,6 +311,15 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
             BDPlugin.propertyLock.withLock {
                 _ = BDPlugin.taskIdsRequiringWiFi.insert(task.taskId)
             }
+        }
+        if isParallelDownloadTask(task: task), provenRangeLength(task) != nil {
+            // Proven range downloads are sequenced natively; a resume continues
+            // from the persisted committed length.
+            let started = RangeDownloader.shared.start(parent: task, notificationConfig: notificationConfigJsonString)
+            if started {
+                await postEnqueuedStatusIfNotAlreadyDone(task: task, notificationConfigJsonString: notificationConfigJsonString)
+            }
+            return started
         }
         if isParallelDownloadTask(task: task) {
             // ParallelDownloadTask itself is not part of a urlSession, so handled separately
@@ -490,6 +504,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         let group = call.arguments as! String
         await BDPlugin.holdingQueue?.stateLock.lock()
         var counter = BDPlugin.holdingQueue?.cancelAllTasks(group: group) ?? 0
+        counter += RangeDownloader.shared.cancelAll(group: group)
         let tasksToCancel = await UrlSessionDelegate.getAllUrlSessionTasks(group: group)
         tasksToCancel.forEach({$0.cancel()})
         await BDPlugin.holdingQueue?.stateLock.unlock()
@@ -508,8 +523,9 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         }
         UrlSessionDelegate.createUrlSession()
         if let urlSessionTasks = await UrlSessionDelegate.urlSession?.allTasks {
-            tasksAsListOfJsonStrings.append(contentsOf: urlSessionTasks.filter({ $0.state == .running || $0.state == .suspended }).compactMap({ getTaskFrom(urlSessionTask: $0)}).filter({group == nil || $0.group == group }).compactMap({ jsonStringFor(task: $0) }))
+            tasksAsListOfJsonStrings.append(contentsOf: urlSessionTasks.filter({ $0.state == .running || $0.state == .suspended }).compactMap({ getTaskFrom(urlSessionTask: $0)}).filter({ rangeChunkMetadata($0) == nil && (group == nil || $0.group == group) }).compactMap({ jsonStringFor(task: $0) }))
         }
+        tasksAsListOfJsonStrings.append(contentsOf: RangeDownloader.shared.activeParents().filter({ group == nil || $0.group == group }).compactMap({ jsonStringFor(task: $0) }))
         await BDPlugin.holdingQueue?.stateLock.unlock()
         os_log("Returning %d unfinished tasks", log: log, type: .debug, tasksAsListOfJsonStrings.count)
         result(tasksAsListOfJsonStrings)
@@ -532,6 +548,8 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
         tasksToCancel.forEach({$0.cancel()})
         // cancel all ParallelDownloadTasks (they would not have shown up in tasksToCancel)
         taskIdsRemaining.forEach { ParallelDownloader.downloads[$0]?.cancelTask() }
+        // Every id: a resumed range parent may have just left the holding queue.
+        taskIds.forEach { _ = RangeDownloader.shared.cancel(parentTaskId: $0) }
         result(true)
         await BDPlugin.holdingQueue?.stateLock.unlock()
     }
@@ -542,7 +560,7 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     private func methodTaskForId(call: FlutterMethodCall, result: @escaping FlutterResult) async {
         let taskId = call.arguments as! String
         await BDPlugin.holdingQueue?.stateLock.lock()
-        var foundTask = BDPlugin.holdingQueue?.taskForId(taskId)
+        var foundTask = BDPlugin.holdingQueue?.taskForId(taskId) ?? RangeDownloader.shared.parent(taskId: taskId)
         if (foundTask == nil) {
             foundTask = await UrlSessionDelegate.getTaskWithId(taskId: taskId)
         }
@@ -590,6 +608,9 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
     /// - Parameter taskId: The ID of the task to pause.
     /// - Returns: `true` if the pause was likely successful, `false` otherwise.
     private func pauseSingleTask(taskId: String) async -> Bool {
+        if RangeDownloader.shared.owns(parentTaskId: taskId) {
+            return RangeDownloader.shared.pause(parentTaskId: taskId)
+        }
         UrlSessionDelegate.createUrlSession()
         BDPlugin.propertyLock.withLock({
             _ = BDPlugin.taskIdsProgrammaticallyCanceledAfterStart.insert(taskId)
@@ -951,6 +972,19 @@ public class BDPlugin: NSObject, FlutterPlugin, UNUserNotificationCenterDelegate
             else {
                 os_log("No task", log: log, type: .error)
                 return
+            }
+            // Local patch: range parents have no URLSession task of their own.
+            if RangeDownloader.shared.owns(parentTaskId: task.taskId) {
+                switch response.actionIdentifier {
+                case "pause_action":
+                    _ = RangeDownloader.shared.pause(parentTaskId: task.taskId)
+                    return
+                case "cancel_action", "cancel_inactive_action":
+                    _ = RangeDownloader.shared.cancel(parentTaskId: task.taskId)
+                    return
+                default:
+                    break // resume re-enqueues the parent below; taps open the app
+                }
             }
             switch response.actionIdentifier {
             case "pause_action":

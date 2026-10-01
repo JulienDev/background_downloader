@@ -42,7 +42,9 @@ class WiFiQueue {
                 var haveReEnqueued = false
                 urlSessionTasks.forEach { urlSessionTask in
                     if (urlSessionTask is URLSessionDownloadTask && (urlSessionTask.state == .running || urlSessionTask.state == .suspended)) {
-                        guard let task = getTaskFrom(urlSessionTask: urlSessionTask) else {
+                        guard let task = getTaskFrom(urlSessionTask: urlSessionTask),
+                              rangeChunkMetadata(task) == nil // RangeDownloader restarts its own pieces
+                        else {
                             return
                         }
                         BDPlugin.propertyLock.withLock {
@@ -72,6 +74,7 @@ class WiFiQueue {
                         }
                     }
                 }
+                RangeDownloader.shared.reapplyWiFiPolicy()
                 if !haveReEnqueued {
                     self.reEnqueuesDone() // nothing left to do
                 }

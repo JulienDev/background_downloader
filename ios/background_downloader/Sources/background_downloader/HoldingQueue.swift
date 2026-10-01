@@ -63,12 +63,15 @@ class HoldingQueue {
         if !reEntry {
             await stateLock.lock()
         }
-        let host = getHost(task)
-        concurrent -= 1
-        concurrentByHost[host]? -= 1
-        concurrentByGroup[task.group]? -= 1
+        // Local patch: only tasks this queue started hold a slot (range pieces
+        // and tasks enqueued without the queue do not), and counts never go
+        // negative after a periodic recount.
         if let index = enqueuedTaskIds.firstIndex(of: task.taskId) {
             enqueuedTaskIds.remove(at: index)
+            let host = getHost(task)
+            concurrent = max(concurrent - 1, 0)
+            concurrentByHost[host] = max((concurrentByHost[host] ?? 0) - 1, 0)
+            concurrentByGroup[task.group] = max((concurrentByGroup[task.group] ?? 0) - 1, 0)
         }
         advanceQueue()
         if (!reEntry) {
@@ -203,7 +206,8 @@ class HoldingQueue {
         for task in tasks {
             let host = getHost(task)
             concurrentByHost[host, default: 0] += 1
-            concurrentByGroup[task.group, default: 0] += 1
+            // Local patch: a range piece counts under its parent's group.
+            concurrentByGroup[rangeChunkMetadata(task)?["group"] ?? task.group, default: 0] += 1
         }
         await stateLock.unlock()
     }

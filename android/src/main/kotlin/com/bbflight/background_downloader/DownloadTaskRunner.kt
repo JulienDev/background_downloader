@@ -11,9 +11,13 @@ import androidx.preference.PreferenceManager
 import com.bbflight.background_downloader.UriUtils.unpack
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FilterOutputStream
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
@@ -34,6 +38,26 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
     private var requiredStartByte = 0L // required start byte within the task range
     private var taskRangeStartByte = 0L // Start of the Task's download range
     private var eTag: String? = null
+    private var rangeBodyStarted = false
+    private var invalidRangeBody = false
+    // The server answered with a range or identity contradicting the prefix.
+    private var rejectedRangeResponse = false
+    private var publishedRangeFile: File? = null
+
+    // Only app-probed, full-file ranges opt into this local recovery path.
+    private val rangeTotal: Long? by lazy {
+        val metadata = try {
+            Json.parseToJsonElement(task.metaData) as? JsonObject
+        } catch (_: Exception) {
+            null
+        }
+        if (metadata?.get("rangeResume") != JsonPrimitive(true)) null
+        else {
+            val total = (metadata["rangeTotal"] as? JsonPrimitive)?.content?.toLongOrNull()
+            if (total == null || total <= 0) throw IOException("Invalid rangeTotal: ${task.metaData}")
+            total
+        }
+    }
 
     /**
      * Make the request to the [connection] and process the [Task]
@@ -41,7 +65,11 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
      * Returns the [TaskStatus]
      * */
     override suspend fun connectAndProcess(connection: HttpURLConnection): TaskStatus {
-        if (isResume) {
+        if (rangeTotal != null) {
+            connection.setRequestProperty("Range", "bytes=${if (isResume) requiredStartByte else 0}-")
+            connection.setRequestProperty("Accept-Encoding", "identity")
+            Log.i(TAG, "Range request ${task.taskId}: ${task.url}, headers=${connection.requestProperties}")
+        } else if (isResume) {
             val taskRangeHeader = task.headers["Range"] ?: ""
             val taskRange = parseRange(taskRangeHeader)
             taskRangeStartByte = taskRange.first
@@ -49,14 +77,37 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             val newRangeString = "bytes=${resumeRange.first}-${resumeRange.second ?: ""}"
             connection.setRequestProperty("Range", newRangeString)
         }
-        val result = super.connectAndProcess(connection)
-        if (result == TaskStatus.canceled) {
-            deleteTempFile()
+        try {
+            var result = super.connectAndProcess(connection)
+            if (rangeTotal != null && result == TaskStatus.paused && !rangeBodyStarted) {
+                BDPlugin.pausedTaskIds.remove(task.taskId)
+                if (isResume && File(tempFilePath).length() == requiredStartByte) {
+                    processResumeData(ResumeData(task, tempFilePath, requiredStartByte, eTag), prefs)
+                } else {
+                    taskException = TaskException(ExceptionType.resume, description = "Paused before a resumable file was created")
+                    result = TaskStatus.failed
+                }
+            }
+            if (result == TaskStatus.canceled ||
+                (rangeTotal != null && BDPlugin.canceledTaskIds.contains(task.taskId))) {
+                deleteTempFile()
+                deletePublishedRangeFile()
+                if (rangeTotal != null && BDPlugin.canceledTaskIds.contains(task.taskId)) result = TaskStatus.canceled
+            } else if (result == TaskStatus.failed || (rangeTotal != null && result == TaskStatus.notFound)) {
+                // A marked prefix survives a final failure or 404 for a user retry.
+                prepResumeAfterFailure()
+            }
+            return result
+        } finally {
+            // Rejected headers must not leave an unread video response active.
+            if (rangeTotal != null) {
+                connection.disconnect()
+                if (BDPlugin.canceledTaskIds.contains(task.taskId)) {
+                    deleteTempFile()
+                    deletePublishedRangeFile()
+                }
+            }
         }
-        if (result == TaskStatus.failed) {
-            prepResumeAfterFailure()
-        }
-        return result
     }
 
     /** Process the response to the GET or POST request on this [connection]
@@ -68,7 +119,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
     ): TaskStatus {
         // Check if the file should be skipped
         val skipThreshold = prefs.getInt(BDPlugin.keyConfigSkipExistingFiles, -1)
-        if (skipThreshold != -1) {
+        if (rangeTotal == null && skipThreshold != -1) {
             val filePath = task.filePath(context.appContext)
             val file = File(filePath)
             if (file.exists()) {
@@ -81,11 +132,20 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         }
 
         responseStatusCode = connection.responseCode
+        val total = rangeTotal
+        if (total != null) {
+            Log.i(TAG, "Range response ${task.taskId}: ${connection.url}, status=$responseStatusCode, headers=${connection.headerFields}")
+            if (UriUtils.containsUri(task.directory) || UriUtils.containsUri(task.filename)) {
+                throw IOException("Range recovery requires a file destination: ${task.directory}/${task.filename}")
+            }
+            if (connection.responseCode in 200..206) validateRangeResponse(connection, total)
+        }
         if (connection.responseCode in 200..206) {
             // determine if we are using Uri or not.  Uri means pause/resume not allowed
             val directoryUri = UriUtils.uriFromStringValue(task.directory)
             val usesUri = directoryUri != null
-            eTagHeader = connection.headerFields["ETag"]?.first()
+            eTagHeader = if (total == null) connection.headerFields["ETag"]?.first()
+                else rangeHeader(connection, "ETag")
             val acceptRangesHeader = connection.headerFields["Accept-Ranges"]
             serverAcceptsRanges =
                 acceptRangesHeader?.first() == "bytes" || connection.responseCode == 206
@@ -133,7 +193,8 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             }
             extractResponseHeaders(connection.headerFields)
             extractContentType(connection.headerFields)
-            val contentLength = getContentLength(connection.headerFields, task)
+            val contentLength = if (total == null) getContentLength(connection.headerFields, task)
+                else total - startByte
             // determine tempFile, or set to null if Uri is used
             val tempFile = if (!usesUri) {
                 val applicationSupportPath =
@@ -244,16 +305,41 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             context.updateEstimatedNetworkBytes(contentLength, 0L)
             // transfer the bytes from the server to the output stream
             val transferBytesResult: TaskStatus
-            BufferedInputStream(connection.inputStream).use { inputStream ->
-                transferBytesResult = transferBytes(
-                    inputStream, outputStream, contentLength, task
-                )
+            if (total == null) {
+                BufferedInputStream(connection.inputStream).use { inputStream ->
+                    transferBytesResult = transferBytes(inputStream, outputStream, contentLength, task)
+                }
+                outputStream.flush()
+                outputStream.close()
+            } else {
+                rangeBodyStarted = true
+                // Reject excess bytes before writing them into a reusable prefix.
+                val checkedOutput = object : FilterOutputStream(outputStream) {
+                    override fun write(buffer: ByteArray, offset: Int, length: Int) {
+                        if (length.toLong() > contentLength - bytesTotal) {
+                            invalidRangeBody = true
+                            throw IOException("Range body exceeds $contentLength bytes for ${task.url}")
+                        }
+                        out.write(buffer, offset, length)
+                    }
+                }
+                checkedOutput.use { output ->
+                    BufferedInputStream(connection.inputStream).use { input ->
+                        transferBytesResult = transferBytes(input, output, contentLength, task)
+                    }
+                    output.flush()
+                }
             }
-            outputStream.flush()
-            outputStream.close()
             // act on the result of the bytes transfer
             when (transferBytesResult) {
                 TaskStatus.complete -> {
+                    if (total != null && tempFile?.length() != total) {
+                        throw IOException("Incomplete range file: ${tempFile?.length()} of $total bytes for ${task.url}")
+                    }
+                    if (total != null && BDPlugin.canceledTaskIds.contains(task.taskId)) {
+                        deleteTempFile()
+                        return TaskStatus.canceled
+                    }
                     if (tempFile == null) {
                         Log.i(
                             TAG, "Successfully downloaded taskId ${task.taskId} to URI $destUri"
@@ -272,10 +358,12 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                                     destFile.toPath(),
                                     StandardCopyOption.REPLACE_EXISTING
                                 )
+                                if (total != null) publishedRangeFile = destFile
                             }
                             setFileOwnership(destFile)
                         } else {
                             tempFile.copyTo(destFile, overwrite = true)
+                            if (total != null) publishedRangeFile = destFile
                             deleteTempFile()
                             setFileOwnership(destFile)
                         }
@@ -356,7 +444,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 }
 
                 TaskStatus.failed -> {
-                    prepResumeAfterFailure()
+                    if (total == null) prepResumeAfterFailure()
                     return TaskStatus.failed
                 }
 
@@ -416,6 +504,17 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         tempFilePath = if (requiredStartByte > 0) context.getInputString(keyResumeDataData) ?: ""
         else ""
         val tempFile = File(tempFilePath)
+        val total = rangeTotal
+        if (total != null) {
+            if (requiredStartByte in 1 until total && tempFile.isFile && tempFile.length() == requiredStartByte) {
+                return true
+            }
+            Log.i(TAG, "Cannot resume range file $tempFilePath: length=${tempFile.length()}, offset=$requiredStartByte, total=$total")
+            deleteTempFile()
+            tempFilePath = ""
+            requiredStartByte = 0
+            return false
+        }
         if (tempFile.exists()) {
             val tempFileLength = tempFile.length()
             if (tempFileLength == requiredStartByte) {
@@ -454,6 +553,12 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
     private fun prepareResume(connection: HttpURLConnection): Boolean {
         if (tempFilePath.isEmpty()) {
             return false
+        }
+        if (rangeTotal != null) {
+            // The exact response was already checked before opening the file.
+            if (File(tempFilePath).length() != requiredStartByte) return false
+            startByte = requiredStartByte
+            return true
         }
         val contentRanges = connection.headerFields["Content-Range"]
         if (contentRanges == null || contentRanges.size > 1) {
@@ -508,7 +613,24 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
      * If this is not possible, the temp file will be deleted
      */
     private suspend fun prepResumeAfterFailure() {
-        if (serverAcceptsRanges && bytesTotal + startByte > 1 shl 20) {
+        val total = rangeTotal
+        if (total != null) {
+            val file = File(tempFilePath)
+            val length = file.length()
+            val validPrefix = if (rangeBodyStarted) !invalidRangeBody && length == startByte + bytesTotal
+                else isResume && length == requiredStartByte
+            // Kept whatever the remaining retries after cuts and HTTP errors: Dart
+            // refills the budget after progress and keeps the ResumeData after a
+            // final failure. A final response contradicting the prefix drops it.
+            val contradicted = rejectedRangeResponse && task.retriesRemaining <= 0
+            if (!contradicted && file.isFile && length in 1 until total && validPrefix) {
+                val retainedETag = if (rangeBodyStarted) eTagHeader else eTag
+                Log.i(TAG, "Retaining range file ${task.taskId}: $tempFilePath, offset=$length, total=$total, ETag=$retainedETag")
+                processResumeData(ResumeData(task, tempFilePath, length, retainedETag), prefs)
+            } else {
+                deleteTempFile()
+            }
+        } else if (serverAcceptsRanges && bytesTotal + startByte > 1 shl 20) {
             // if failure can be resumed, post resume data
             processResumeData(
                 ResumeData(
@@ -518,6 +640,37 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         } else {
             // if it cannot be resumed, delete the temp file
             deleteTempFile()
+        }
+    }
+
+    /** A rejected response must never alter an already validated prefix. */
+    private fun validateRangeResponse(connection: HttpURLConnection, total: Long) {
+        val offset = if (isResume) requiredStartByte else 0L
+        val expectedRange = "bytes $offset-${total - 1}/$total"
+        val contentRange = rangeHeader(connection, "Content-Range")
+        val encoding = rangeHeader(connection, "Content-Encoding")
+        val length = rangeHeader(connection, "Content-Length")
+        if (connection.responseCode != 206 || contentRange != expectedRange ||
+            (encoding != null && !encoding.equals("identity", ignoreCase = true)) ||
+            (length != null && length.toLongOrNull() != total - offset)) {
+            rejectedRangeResponse = true
+            throw IOException("Invalid range response for ${task.url}: status=${connection.responseCode}, Content-Range=$contentRange, Content-Encoding=$encoding, Content-Length=$length, expected=$expectedRange")
+        }
+    }
+
+    private fun rangeHeader(connection: HttpURLConnection, name: String): String? {
+        val values = connection.headerFields.entries
+            .filter { it.key?.equals(name, ignoreCase = true) == true }
+            .flatMap { it.value }
+        if (values.isEmpty()) return null
+        if (values.size != 1) throw IOException("Duplicate $name for ${task.url}: $values")
+        return values.single().trim()
+    }
+
+    private fun deletePublishedRangeFile() {
+        // Only delete a final file actually published by this runner.
+        publishedRangeFile?.let { file ->
+            if (!file.delete() && file.exists()) Log.w(TAG, "Could not delete canceled range file ${file.absolutePath}")
         }
     }
 

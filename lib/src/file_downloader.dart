@@ -699,6 +699,15 @@ interface class FileDownloader {
     final failedToEnqueue = <Task>[];
     var startTime = DateTime.now();
     for (final task in missingTasks) {
+      // Local patch: a range download that kept bytes (ResumeData) continues
+      // from them instead of starting again from byte 0.
+      if (task is DownloadTask &&
+          _downloader.isRangeResumeTask(task) &&
+          await _downloader.getResumeData(task.taskId) != null &&
+          await FileDownloader().resume(task)) {
+        successfullyEnqueued.add(task);
+        continue;
+      }
       await database.deleteRecordWithId(task.taskId);
       if (await FileDownloader().enqueue(task)) {
         successfullyEnqueued.add(task);
@@ -719,6 +728,11 @@ interface class FileDownloader {
   /// information from the server to determine whether resume is possible, or
   /// if the task fails and resume is possible
   Future<bool> taskCanResume(Task task) => _downloader.taskCanResume(task);
+
+  /// Local patch: deletes native iOS range downloads (state and partial file)
+  /// whose task ids are not in [taskIds], e.g. all tracked database records.
+  Future<void> retainRangeDownloads(Iterable<String> taskIds) =>
+      _downloader.retainRangeDownloads(taskIds);
 
   /// Pause the task
   ///

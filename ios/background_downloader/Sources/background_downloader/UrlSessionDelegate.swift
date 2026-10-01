@@ -85,6 +85,10 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
             os_log("Could not find task related to urlSessionTask %d", log: log, type: .error, task.taskIdentifier)
             return
         }
+        // Range pieces bypass the holding queue and Dart; RangeDownloader owns them.
+        if RangeDownloader.shared.handleCompleted(piece: bgdTask, error: error) {
+            return
+        }
         if BDPlugin.propertyLock.withLock( {
             BDPlugin.taskIdsProgrammaticallyCanceledBeforeStart.remove(bgdTask.taskId) != nil
         }) {
@@ -187,6 +191,10 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         // task is var because the filename can be changed on the first 'didWriteData' call
         guard var task = getTaskFrom(urlSessionTask: downloadTask) else { return }
+        if RangeDownloader.shared.handleProgress(piece: task, response: downloadTask.response as? HTTPURLResponse,
+                                                 totalBytesWritten: totalBytesWritten) {
+            return
+        }
         let progressInfo = BDPlugin.propertyLock.withLock({
             BDPlugin.progressInfo[task.taskId]
         })
@@ -305,6 +313,11 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
     public func urlSession(_ session: URLSession,
                            downloadTask: URLSessionDownloadTask,
                            didFinishDownloadingTo location: URL) {
+        if let piece = getTaskFrom(urlSessionTask: downloadTask),
+           RangeDownloader.shared.handleFinished(piece: piece, response: downloadTask.response as? HTTPURLResponse,
+                                                 location: location) {
+            return
+        }
         guard var task = getTaskFrom(urlSessionTask: downloadTask),
               let response = downloadTask.response as? HTTPURLResponse
         else {
@@ -542,6 +555,7 @@ public class UrlSessionDelegate : NSObject, URLSessionDelegate, URLSessionDownlo
             os_log("Not using proxy for any task", log: log, type: .info)
         }
         UrlSessionDelegate.urlSession = URLSession(configuration: config, delegate: UrlSessionDelegate.instance, delegateQueue: nil)
+        RangeDownloader.shared.restoreAfterLaunch()
     }
     
     /// Return all tasks in this urlSession

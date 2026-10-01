@@ -99,6 +99,11 @@ Future<bool> resumeChunkTasks(
   ParallelDownloadTask task,
   ResumeData resumeData,
 ) async {
+  // Local patch: iOS sequences proven range downloads natively; their resume
+  // data is a marker and there are no chunk tasks to resume.
+  if (isRangeChunksTask(task)) {
+    return true;
+  }
   final chunks = List<Chunk>.from(
     jsonDecode(resumeData.data, reviver: Chunk.listReviver),
   );
@@ -112,4 +117,16 @@ Future<bool> resumeChunkTasks(
     return false;
   }
   return true;
+}
+
+/// True for a [ParallelDownloadTask] marked by the app after a Range probe.
+bool isRangeChunksTask(Task task) {
+  try {
+    final metadata = jsonDecode(task.metaData);
+    return task is ParallelDownloadTask &&
+        metadata is Map &&
+        metadata['rangeChunks'] == true;
+  } on FormatException {
+    return false;
+  }
 }

@@ -388,6 +388,16 @@ abstract base class NativeDownloader extends BaseDownloader {
   }
 
   @override
+  Future<void> retainRangeDownloads(Iterable<String> taskIds) async {
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      await methodChannel.invokeMethod(
+        'retainRangeDownloads',
+        taskIds.toList(growable: false),
+      );
+    }
+  }
+
+  @override
   Future<bool> requireWiFi(
     RequireWiFi requirement,
     rescheduleRunningTasks,

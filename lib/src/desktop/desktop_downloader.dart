@@ -377,7 +377,26 @@ final class DesktopDownloader extends BaseDownloader {
     final inQueue = _queue.unorderedElements
         .where((task) => taskIds.contains(task.taskId))
         .toList(growable: false);
+    // Remove the whole batch before file I/O yields to queue admission.
     for (final task in inQueue) {
+      _queue.remove(task);
+      _resume.remove(task);
+    }
+    for (final task in inQueue) {
+      if (task is DownloadTask && isRangeResumeTask(task)) {
+        // No isolate owns a queued resume. Delete its retained prefix before
+        // the final status clears the associated ResumeData.
+        final resumeData = await getResumeData(task.taskId);
+        if (resumeData != null) {
+          try {
+            await File(resumeData.tempFilepath).delete();
+          } on FileSystemException catch (error) {
+            _log.fine(
+              'Could not delete canceled range file ${resumeData.tempFilepath}: $error',
+            );
+          }
+        }
+      }
       processStatusUpdate(TaskStatusUpdate(task, TaskStatus.canceled));
       _remove(task);
     }
