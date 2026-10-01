@@ -23,7 +23,7 @@ From this package, use an explicitly selected disposable Android device or
 emulator and the workspace's configured Flutter 3.41.9/JDK 21:
 
 ```sh
-python3 test/native/run_android_range_fixtures.py --device emulator-5580
+python3 test/native/run_android_range_fixtures.py --device emulator-5580 --workspace <iptv-flutter checkout>
 ```
 
 The runner creates a separate Flutter host with the local plugin dependency and

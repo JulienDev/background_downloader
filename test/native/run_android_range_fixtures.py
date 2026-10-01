@@ -21,8 +21,9 @@ import time
 import zipfile
 
 
-WORKSPACE = Path(__file__).resolve().parents[4]
-PLUGIN = WORKSPACE / "third_party/background_downloader"
+PLUGIN = Path(__file__).resolve().parents[2]
+# The IPTV Flutter workspace supplies .fvmrc and the final Android native gate.
+WORKSPACE = Path(os.environ.get("IPTV_FLUTTER_WORKSPACE", PLUGIN.parents[1]))
 TEST = Path(__file__).with_name("android_range_resume_test.dart")
 PACKAGE = "app.iptv.tests.android_range_fixtures"
 
@@ -289,7 +290,18 @@ def main() -> int:
         "--artifacts", type=Path,
         default=Path("/private/tmp") / f"android-range-fixtures-{time.strftime('%Y%m%d-%H%M%S')}",
     )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        help="IPTV Flutter repository (default: $IPTV_FLUTTER_WORKSPACE, else two levels above the plugin)",
+    )
     arguments = parser.parse_args()
+    if arguments.workspace:
+        global WORKSPACE
+        WORKSPACE = arguments.workspace.resolve()
+    for required in (WORKSPACE / ".fvmrc", WORKSPACE / "scripts/validate_android_native.gradle"):
+        if not required.exists():
+            parser.error(f"--workspace must be the IPTV Flutter repository; missing {required}")
     if not arguments.prepare_only and not arguments.device:
         parser.error("--device is required; the runner never selects or starts an emulator")
     artifacts = arguments.artifacts.resolve()
