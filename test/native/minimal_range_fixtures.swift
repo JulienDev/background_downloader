@@ -608,6 +608,50 @@ enum MinimalRangeFixtures {
                   "later refusal fails but keeps bytes")
         }
 
+        // Prepare mode: requested by the app, pieces resolve the provider URL in the app.
+        do {
+            let h = Harness(directory: root.appendingPathComponent("prepare"))
+            let data = source(2 * mib)
+            var prepared = parent("prepare", size: Int64(2 * mib))
+            prepared.headers["Host"] = "provider.example:8000"
+            prepared.metaData = "{\"rangeChunks\":true,\"rangePieceBytes\":\(mib),\"rangePrepare\":true,"
+                + "\"rangeSourceUrl\":\"http://provider.example:8000/movie/prepare.mkv\"}"
+            h.downloader.start(parent: prepared, notificationConfig: nil)
+            check(rangePiecePrepareUrl(h.transport.current) == "http://provider.example:8000/movie/prepare.mkv",
+                  "prepared piece resolves the provider source URL")
+            check(h.transport.current.headers["Host"] == nil, "prepared piece drops the provider Host")
+            _ = h.downloader.handlePrepareFailed(piece: h.transport.current, reason: "HTTP 406", httpCode: 406)
+            check(h.transport.started.count == 2 && h.events.last("prepare") != .failed, "failed preparation retries")
+            check(rangePiecePrepareUrl(h.transport.current) != nil, "retry is prepared too")
+            while h.downloader.owns(parentTaskId: "prepare") { deliver(h, data) }
+            check(output(h, "prepare") == data, "prepared pieces produce exact bytes")
+
+            let missing = Harness(directory: root.appendingPathComponent("prepare-404"))
+            var gone = parent("prepare-404", size: 10)
+            gone.metaData = "{\"rangeChunks\":true,\"rangePrepare\":true}"
+            missing.downloader.start(parent: gone, notificationConfig: nil)
+            check(rangePiecePrepareUrl(missing.transport.current) == gone.url, "without a source URL, the parent URL is prepared")
+            _ = missing.downloader.handlePrepareFailed(piece: missing.transport.current, reason: "HTTP 404", httpCode: 404)
+            check(missing.events.last("prepare-404") == .notFound, "a 404 while preparing is not found")
+        }
+
+        // The daemon cannot resolve the name: the download switches to prepared pieces.
+        do {
+            let h = Harness(directory: root.appendingPathComponent("switch"))
+            let data = source(2 * mib)
+            h.downloader.start(parent: parent("switch", size: Int64(2 * mib)), notificationConfig: nil)
+            check(rangePiecePrepareUrl(h.transport.current) == nil, "normal piece is not prepared")
+            _ = h.downloader.handleCompleted(piece: h.transport.current, error: URLError(.cannotFindHost))
+            check(rangePiecePrepareUrl(h.transport.current) != nil && h.transport.started.last!.earliestBegin == nil,
+                  "name failure switches to an immediate prepared piece")
+            check(h.downloader.state("switch")!.retriesRemaining == 3, "the switch costs no retry")
+            check(h.store.loadAll()["switch"]?.prepare == true, "the switch is persisted")
+            deliver(h, data)
+            check(rangePiecePrepareUrl(h.transport.current) != nil, "later pieces stay prepared")
+            while h.downloader.owns(parentTaskId: "switch") { deliver(h, data) }
+            check(output(h, "switch") == data, "switched download produces exact bytes")
+        }
+
         print("Range fixtures passed: \(assertions) assertions")
     }
 }

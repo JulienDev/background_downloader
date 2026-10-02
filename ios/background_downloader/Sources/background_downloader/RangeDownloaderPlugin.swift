@@ -10,14 +10,129 @@ import Foundation
 import UIKit
 import os.log
 
+/// Resolves a provider redirect in the app process, which uses the app's DNS
+/// settings (its encrypted DNS), unlike nsurlsessiond. Each request stops at
+/// its final response, without reading the body.
+final class RangePrepareSession: NSObject, URLSessionDataDelegate {
+    static let shared = RangePrepareSession()
+    private let lock = NSLock()
+    private var handlers = [Int: (HTTPURLResponse?, Error?) -> Void]()
+    private lazy var session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 30
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }()
+
+    func resolve(_ request: URLRequest, completion: @escaping (HTTPURLResponse?, Error?) -> Void) -> URLSessionDataTask {
+        let task = session.dataTask(with: request)
+        lock.withLock { handlers[task.taskIdentifier] = completion }
+        task.resume()
+        return task
+    }
+
+    private func finish(_ task: URLSessionTask, _ response: HTTPURLResponse?, _ error: Error?) {
+        guard let handler = lock.withLock({ handlers.removeValue(forKey: task.taskIdentifier) }) else { return }
+        handler(response, error)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        completionHandler(.cancel)
+        finish(dataTask, response as? HTTPURLResponse, nil)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        finish(task, nil, error ?? URLError(.badServerResponse))
+    }
+}
+
+/// Keeps the app running while a piece is prepared in the background.
+private final class RangeBackgroundAssertion {
+    private let lock = NSLock()
+    private var identifier = UIBackgroundTaskIdentifier.invalid
+
+    init(name: String) {
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in self?.end() }
+    }
+
+    func end() {
+        lock.withLock {
+            guard identifier != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(identifier)
+            identifier = .invalid
+        }
+    }
+}
+
 /// Runs piece transfers on the plugin's background URLSession.
 final class URLSessionRangeTransport: RangeTransport {
     private let lock = NSLock()
     private var tasks = [String: URLSessionDownloadTask]()
+    /// Prepared pieces still resolving their URL (nil while waiting to start).
+    private var preparing = [String: URLSessionDataTask?]()
 
     func start(piece: Task, earliestBegin: Date?) -> Bool {
+        if let prepareUrl = rangePiecePrepareUrl(piece) {
+            return startPrepared(piece: piece, prepareUrl: prepareUrl, earliestBegin: earliestBegin)
+        }
+        return startTransfer(piece: piece, url: piece.url, earliestBegin: earliestBegin)
+    }
+
+    /// Resolves the provider redirect in the app, then transfers the final URL
+    /// at once: its token may expire within seconds. The wait for
+    /// [earliestBegin] happens before resolving, for the same reason.
+    private func startPrepared(piece: Task, prepareUrl: String, earliestBegin: Date?) -> Bool {
+        guard let url = URL(string: prepareUrl), let from = rangeChunkMetadata(piece)?["from"] else { return false }
+        lock.withLock { preparing[piece.taskId] = .some(nil) }
+        let assertion = RangeBackgroundAssertion(name: "range-prepare-\(piece.taskId)")
+        let delay = max(earliestBegin?.timeIntervalSinceNow ?? 0, 0)
+        DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+            guard self.lock.withLock({ self.preparing[piece.taskId] != nil }) else {
+                assertion.end()
+                return
+            }
+            var request = URLRequest(url: url)
+            for (key, value) in piece.headers where key.lowercased() != "range" {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+            request.setValue("bytes=\(from)-\(from)", forHTTPHeaderField: "Range")
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            request.allowsCellularAccess = !taskRequiresWiFi(task: piece)
+            os_log("Range piece %{public}@ preparing %{public}@ headers=%{public}@", log: log, type: .info,
+                   piece.taskId, prepareUrl, "\(request.allHTTPHeaderFields ?? [:])")
+            let task = RangePrepareSession.shared.resolve(request) { response, error in
+                defer { assertion.end() }
+                guard self.lock.withLock({ self.preparing.removeValue(forKey: piece.taskId) != nil }) else { return }
+                guard let response = response, let finalUrl = response.url else {
+                    _ = RangeDownloader.shared.handlePrepareFailed(
+                        piece: piece, reason: "\(error?.localizedDescription ?? "no response") error=\(String(describing: error))",
+                        httpCode: nil)
+                    return
+                }
+                let contentRange = response.value(forHTTPHeaderField: "Content-Range")?.lowercased() ?? ""
+                guard response.statusCode == 206, contentRange.hasPrefix("bytes \(from)-") else {
+                    _ = RangeDownloader.shared.handlePrepareFailed(
+                        piece: piece, reason: "HTTP \(response.statusCode) final=\(finalUrl) headers=\(response.allHeaderFields)",
+                        httpCode: response.statusCode)
+                    return
+                }
+                os_log("Range piece %{public}@ prepared %{public}@ -> %{public}@", log: log, type: .info,
+                       piece.taskId, prepareUrl, finalUrl.absoluteString)
+                if !self.startTransfer(piece: piece, url: finalUrl.absoluteString, earliestBegin: nil) {
+                    _ = RangeDownloader.shared.handlePrepareFailed(
+                        piece: piece, reason: "Could not start the transfer of \(finalUrl)", httpCode: nil)
+                }
+            }
+            self.lock.withLock {
+                if self.preparing[piece.taskId] != nil { self.preparing[piece.taskId] = task }
+            }
+        }
+        return true
+    }
+
+    private func startTransfer(piece: Task, url: String, earliestBegin: Date?) -> Bool {
         UrlSessionDelegate.createUrlSession()
-        guard let session = UrlSessionDelegate.urlSession, let url = URL(string: piece.url) else { return false }
+        guard let session = UrlSessionDelegate.urlSession, let url = URL(string: url) else { return false }
         var request = URLRequest(url: url)
         for (key, value) in piece.headers {
             request.setValue(value, forHTTPHeaderField: key)
@@ -44,6 +159,10 @@ final class URLSessionRangeTransport: RangeTransport {
     }
 
     func cancel(pieceTaskId: String) {
+        if let entry = lock.withLock({ preparing.removeValue(forKey: pieceTaskId) }) {
+            entry?.cancel()
+            return
+        }
         if let task = lock.withLock({ tasks.removeValue(forKey: pieceTaskId) }) {
             task.cancel()
             return
@@ -56,12 +175,14 @@ final class URLSessionRangeTransport: RangeTransport {
 
     func liveTaskIds(_ completion: @escaping (Set<String>) -> Void) {
         UrlSessionDelegate.createUrlSession()
+        // A piece resolving its URL is in flight too.
+        let resolving = Set(lock.withLock { preparing.keys })
         guard let session = UrlSessionDelegate.urlSession else {
-            completion([])
+            completion(resolving)
             return
         }
         session.getAllTasks { sessionTasks in
-            var live = Set<String>()
+            var live = resolving
             for case let task as URLSessionDownloadTask in sessionTasks where task.state == .running || task.state == .suspended {
                 guard let piece = getTaskFrom(urlSessionTask: task), rangeChunkMetadata(piece) != nil else { continue }
                 live.insert(piece.taskId)

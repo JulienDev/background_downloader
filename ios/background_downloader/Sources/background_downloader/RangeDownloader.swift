@@ -9,6 +9,10 @@
 //  whose committed length is persisted; the download survives retries, pauses,
 //  app suspension and process termination without Dart involvement.
 //
+//  In prepare mode (`rangePrepare`, or after the daemon fails to resolve the
+//  provider name) the app resolves the provider redirect itself, through its
+//  own DNS, right before each piece and hands the final URL to the session.
+//
 
 import Foundation
 import os.log
@@ -30,6 +34,36 @@ let defaultRangePieceBytes: Int64 = 64 << 20
 /// (which starts such transfers at its discretion) schedules fewer of them.
 let backgroundPieceMultiplier: Int64 = 4
 let minimumRangePieceBytes: Int64 = 1 << 20
+
+/// True when the app asked to resolve the provider redirect before each piece
+/// (`rangePrepare`): the background daemon cannot reach the provider itself.
+func rangePrepareRequested(_ task: Task) -> Bool {
+    guard let data = task.metaData.data(using: .utf8),
+          let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+    return metadata["rangePrepare"] as? Bool == true
+}
+
+/// The URL a prepared piece resolves in the app: the provider URL recorded by
+/// the app (`rangeSourceUrl`, with its name), else the parent's URL.
+func rangePrepareUrl(_ parent: Task) -> String {
+    guard let data = parent.metaData.data(using: .utf8),
+          let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let url = metadata["rangeSourceUrl"] as? String, !url.isEmpty else { return parent.url }
+    return url
+}
+
+/// For a piece whose transport resolves the provider redirect first, the URL to resolve.
+func rangePiecePrepareUrl(_ piece: Task) -> String? {
+    rangeChunkMetadata(piece)?["prepareUrl"]
+}
+
+/// Errors meaning nsurlsessiond could not resolve the name: it uses the system
+/// DNS, which may block the provider, while the app uses its own.
+func isNameResolutionError(_ error: Error) -> Bool {
+    let code = (error as NSError).code
+    return (error as NSError).domain == NSURLErrorDomain
+        && (code == NSURLErrorCannotFindHost || code == NSURLErrorDNSLookupFailed)
+}
 
 /// Piece size requested by the app (`rangePieceBytes`), bounded to at least 1 MiB.
 func rangePieceBytes(_ task: Task) -> Int64 {
@@ -107,6 +141,8 @@ struct RangeDownloadState: Codable {
     var publishing = false
     /// Identifies this download instance; a restart of the same task gets a new one.
     var generation = UUID().uuidString
+    /// Resolve the provider redirect in the app before each piece.
+    var prepare = false
 
     init(parent: Task, notificationConfig: String?, total: Int64) {
         self.parent = parent
@@ -114,6 +150,7 @@ struct RangeDownloadState: Codable {
         self.total = total
         self.pieceBytes = rangePieceBytes(parent)
         self.retriesRemaining = parent.retries
+        self.prepare = rangePrepareRequested(parent)
     }
 
     /// Decodes states saved by earlier versions: fields added later default.
@@ -135,6 +172,7 @@ struct RangeDownloadState: Codable {
         pieceStartedInBackground = try c.decodeIfPresent(Bool.self, forKey: .pieceStartedInBackground) ?? false
         publishing = try c.decodeIfPresent(Bool.self, forKey: .publishing) ?? false
         generation = try c.decodeIfPresent(String.self, forKey: .generation) ?? UUID().uuidString
+        prepare = try c.decodeIfPresent(Bool.self, forKey: .prepare) ?? rangePrepareRequested(parent)
     }
 
     /// Paused or failed: nothing runs until the parent is enqueued again.
@@ -152,14 +190,20 @@ struct RangeDownloadState: Codable {
 /// exact Range and identity encoding. Its metadata identifies parent and range.
 func rangePieceTask(_ state: RangeDownloadState, from: Int64, to: Int64) -> Task {
     let parent = state.parent
+    // A prepared piece requests the final URL: an explicit provider Host would
+    // be wrong there.
     var headers = parent.headers.filter {
         !["known-content-length", "accept-encoding", "range"].contains($0.key.lowercased())
+            && !(state.prepare && $0.key.lowercased() == "host")
     }
     headers["Accept-Encoding"] = "identity"
     headers["Range"] = "bytes=\(from)-\(to)"
     // `group` lets the holding queue count the piece under its parent's group.
-    let metadata = ["parentTaskId": parent.taskId, "from": String(from), "to": String(to),
+    var metadata = ["parentTaskId": parent.taskId, "from": String(from), "to": String(to),
                     "rangeTotal": String(state.total), "group": parent.group]
+    if state.prepare {
+        metadata["prepareUrl"] = rangePrepareUrl(parent)
+    }
     let metaData = (try? JSONEncoder().encode(metadata)).map { String(decoding: $0, as: UTF8.self) } ?? ""
     return Task(taskId: "\(parent.taskId)-r\(state.attempt)", url: parent.url, filename: "\(parent.taskId)-r\(state.attempt).piece",
                 headers: headers, baseDirectory: BaseDirectory.temporary.rawValue, group: chunkGroup,
@@ -647,7 +691,28 @@ final class RangeDownloader {
             lastData.removeValue(forKey: piece.taskId)
             if abandoned.remove(piece.taskId) != nil { return }
             guard let error = error, let id = metadata["parentTaskId"], states[id]?.pieceTaskId == piece.taskId else { return }
+            if isNameResolutionError(error), states[id]?.prepare == false {
+                // The app resolves names the daemon cannot: switch for good.
+                os_log("Range download %{public}@ switches to prepared URLs: %{public}@", log: log, type: .info,
+                       id, "\(error)")
+                states[id]?.prepare = true
+                states[id]?.pieceTaskId = nil
+                save(id, force: true)
+                advance(id, earliestBegin: nil)
+                return
+            }
             pieceFailed(id, reason: "\(error.localizedDescription) url=\(piece.url) error=\(error)", httpCode: nil)
+        }
+        return true
+    }
+
+    /// The app could not resolve the provider redirect for a prepared piece.
+    func handlePrepareFailed(piece: Task, reason: String, httpCode: Int?) -> Bool {
+        guard let metadata = rangeChunkMetadata(piece) else { return false }
+        locked {
+            if abandoned.remove(piece.taskId) != nil { return }
+            guard let id = metadata["parentTaskId"], states[id]?.pieceTaskId == piece.taskId else { return }
+            pieceFailed(id, reason: "Prepare failed: \(reason) url=\(piece.url)", httpCode: httpCode)
         }
         return true
     }
