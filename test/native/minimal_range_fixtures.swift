@@ -108,6 +108,8 @@ enum MinimalRangeFixtures {
         let events = FakeEvents()
         /// Foreground checks wait here until the test runs them.
         let promotions = Deferred()
+        /// Stall checks wait here until the test runs them.
+        let stalls = Deferred()
 
         init(directory: URL) {
             store = RangeStore(directory: directory)
@@ -118,6 +120,8 @@ enum MinimalRangeFixtures {
             downloader.restoreDelay = { $0() }
             let promotions = promotions
             downloader.promoteDelay = { promotions.work.append($0) }
+            let stalls = stalls
+            downloader.stallDelay = { _, work in stalls.work.append(work) }
         }
     }
 
@@ -650,6 +654,31 @@ enum MinimalRangeFixtures {
             check(rangePiecePrepareUrl(h.transport.current) != nil, "later pieces stay prepared")
             while h.downloader.owns(parentTaskId: "switch") { deliver(h, data) }
             check(output(h, "switch") == data, "switched download produces exact bytes")
+        }
+
+        // A foreground piece without any response switches the download to prepared pieces.
+        do {
+            let h = Harness(directory: root.appendingPathComponent("stall"))
+            let data = source(2 * mib)
+            h.downloader.start(parent: parent("stall", size: Int64(2 * mib)), notificationConfig: nil)
+            let stuck = h.transport.current
+            h.stalls.run()
+            check(h.transport.canceled.contains(stuck.taskId), "stalled piece canceled")
+            check(rangePiecePrepareUrl(h.transport.current) != nil && h.downloader.state("stall")!.prepare,
+                  "stall switches to prepared pieces")
+            check(h.downloader.state("stall")!.retriesRemaining == 3, "the switch costs no retry")
+            h.stalls.run()
+            check(h.transport.started.count == 2, "prepared pieces have no stall check")
+            while h.downloader.owns(parentTaskId: "stall") { deliver(h, data) }
+            check(output(h, "stall") == data, "stalled download completes with exact bytes")
+
+            let alive = Harness(directory: root.appendingPathComponent("alive"))
+            alive.downloader.start(parent: parent("alive", size: Int64(2 * mib)), notificationConfig: nil)
+            _ = alive.downloader.handleProgress(piece: alive.transport.current, response: response(alive.transport.current),
+                                                totalBytesWritten: 10)
+            alive.stalls.run()
+            check(alive.transport.canceled.isEmpty && !alive.downloader.state("alive")!.prepare,
+                  "a piece that received data is not stalled")
         }
 
         print("Range fixtures passed: \(assertions) assertions")

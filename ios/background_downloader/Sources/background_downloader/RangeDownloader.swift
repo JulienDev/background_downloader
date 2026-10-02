@@ -404,6 +404,12 @@ final class RangeDownloader {
     var promoteDelay: (@escaping () -> Void) -> Void = { work in
         DispatchQueue.global().asyncAfter(deadline: .now() + 3, execute: work)
     }
+    /// Runs the stall check of a piece after the given number of seconds.
+    var stallDelay: (TimeInterval, @escaping () -> Void) -> Void = { seconds, work in
+        DispatchQueue.global().asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+    /// A foreground piece without any response after this long is stalled.
+    static let stallSeconds: TimeInterval = 45
 
     private let lock = NSRecursiveLock()
     private var loaded = false
@@ -806,7 +812,29 @@ final class RangeDownloader {
             states[id]?.pieceTaskId = nil
             return false
         }
+        if !state.prepare && active {
+            let wait = max(earliestBegin.map { $0.timeIntervalSince(now()) } ?? 0, 0) + RangeDownloader.stallSeconds
+            stallDelay(wait) { self.checkStall(id, piece: piece.taskId) }
+        }
         return true
+    }
+
+    /// nsurlsessiond waits without failing when it cannot resolve a name (the
+    /// system DNS may block the provider or its CDN). A foreground piece that
+    /// got no response at all is abandoned and the download switches to
+    /// prepared pieces, which the app resolves with its own DNS.
+    private func checkStall(_ id: String, piece: String) {
+        locked {
+            guard isAppActive(), let state = states[id], !state.halted, !state.prepare, state.pieceTaskId == piece,
+                  lastData[piece] == nil, !validated.contains(piece), !abandoned.contains(piece) else { return }
+            os_log("Range piece %{public}@ got no response in %f s; %{public}@ switches to prepared URLs", log: log,
+                   type: .info, piece, RangeDownloader.stallSeconds, id)
+            abandon(piece)
+            states[id]?.prepare = true
+            states[id]?.pieceTaskId = nil
+            save(id, force: true)
+            advance(id, earliestBegin: nil)
+        }
     }
 
     /// Starts the next piece of a running download; a refused piece halts it.
