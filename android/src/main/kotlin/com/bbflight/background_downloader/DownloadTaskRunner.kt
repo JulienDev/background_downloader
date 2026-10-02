@@ -507,10 +507,15 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
      * given [tempFilePath] and [requiredStartByte]
      * */
     override fun determineIfResume(): Boolean {
+        // A prefix kept at a system stop is newer than this work's input, which
+        // may hold the resume point of an earlier attempt.
+        if (resumeAfterSystemStop()) {
+            return true
+        }
         // set tempFilePath from resume data, or "" if a new tempFile is needed
         requiredStartByte = context.getInputLong(keyStartByte, 0)
         if (requiredStartByte == 0L) {
-            return resumeAfterSystemStop()
+            return false
         }
         eTag = context.getInputString(keyETag)
         tempFilePath = if (requiredStartByte > 0) context.getInputString(keyResumeDataData) ?: ""
