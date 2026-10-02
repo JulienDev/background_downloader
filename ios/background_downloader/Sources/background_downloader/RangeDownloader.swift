@@ -87,6 +87,8 @@ struct RangeDownloadState: Codable {
     var pieceBytes: Int64
     /// Bytes durably appended to the partial file.
     var committed: Int64 = 0
+    /// Committed length before the latest piece, a known-good fallback.
+    var previousCommitted: Int64 = 0
     /// Highest progress shown to the user; never decreases.
     var displayed: Int64 = 0
     /// Attempt counter, making every piece task id unique.
@@ -103,6 +105,8 @@ struct RangeDownloadState: Codable {
     var pieceStartedInBackground = false
     /// Set just before the complete partial file is moved to its destination.
     var publishing = false
+    /// Identifies this download instance; a restart of the same task gets a new one.
+    var generation = UUID().uuidString
 
     init(parent: Task, notificationConfig: String?, total: Int64) {
         self.parent = parent
@@ -120,6 +124,7 @@ struct RangeDownloadState: Codable {
         total = try c.decode(Int64.self, forKey: .total)
         pieceBytes = try c.decode(Int64.self, forKey: .pieceBytes)
         committed = try c.decodeIfPresent(Int64.self, forKey: .committed) ?? 0
+        previousCommitted = try c.decodeIfPresent(Int64.self, forKey: .previousCommitted) ?? 0
         displayed = try c.decodeIfPresent(Int64.self, forKey: .displayed) ?? committed
         attempt = try c.decodeIfPresent(Int.self, forKey: .attempt) ?? 0
         retriesRemaining = try c.decodeIfPresent(Int.self, forKey: .retriesRemaining) ?? parent.retries
@@ -129,6 +134,7 @@ struct RangeDownloadState: Codable {
         pieceTaskId = try c.decodeIfPresent(String.self, forKey: .pieceTaskId)
         pieceStartedInBackground = try c.decodeIfPresent(Bool.self, forKey: .pieceStartedInBackground) ?? false
         publishing = try c.decodeIfPresent(Bool.self, forKey: .publishing) ?? false
+        generation = try c.decodeIfPresent(String.self, forKey: .generation) ?? UUID().uuidString
     }
 
     /// Paused or failed: nothing runs until the parent is enqueued again.
@@ -222,13 +228,14 @@ final class RangeStore {
 
     /// Aligns the partial file with the committed length after an interruption:
     /// bytes beyond it (an interrupted append) are dropped; a shorter file falls
-    /// back to its last whole piece.
+    /// back to the commit before the latest piece.
     func reconcile(_ state: inout RangeDownloadState) {
         let id = state.parent.taskId
         let size = partialSize(id)
         if size != state.committed {
-            let kept = min(size, state.committed)
-            let aligned = kept == state.total ? kept : kept - kept % state.pieceBytes
+            // Longer: an interrupted append, cut back to the commit. Shorter: the
+            // latest commit was not durable, so fall back to the one before.
+            let aligned = size > state.committed ? state.committed : min(size, state.previousCommitted)
             os_log("Reconciling range partial %{public}@: size=%lld committed=%lld kept=%lld", log: log, type: .info,
                    id, size, state.committed, aligned)
             truncatePartial(id, to: aligned)
@@ -362,6 +369,8 @@ final class RangeDownloader {
     private var lastSave = [String: Date]()
     /// Time of the latest progress callback of each piece.
     private var lastData = [String: Date]()
+    /// Downloads started by this process: Dart may not have recorded them yet.
+    private var startedThisProcess = Set<String>()
     private var depth = 0
     private var pending = [() -> Void]()
 
@@ -457,6 +466,7 @@ final class RangeDownloader {
             }
             store.remove(id)
             states[id] = RangeDownloadState(parent: parent, notificationConfig: notificationConfig, total: total)
+            startedThisProcess.insert(id)
             os_log("Starting range download %{public}@ of %lld bytes, pieces of %lld", log: log, type: .info,
                    id, total, states[id]!.pieceBytes)
             guard startPiece(id, earliestBegin: nil) else {
@@ -510,7 +520,7 @@ final class RangeDownloader {
     /// Silently discards downloads whose parents Dart no longer tracks.
     func retainOnly(parentTaskIds: Set<String>) {
         locked {
-            for (id, state) in states where !parentTaskIds.contains(id) {
+            for (id, state) in states where !parentTaskIds.contains(id) && !startedThisProcess.contains(id) {
                 os_log("Discarding untracked range download %{public}@ (%lld bytes)", log: log, type: .info, id, state.committed)
                 if let piece = state.pieceTaskId { abandon(piece) }
                 states.removeValue(forKey: id)
@@ -589,9 +599,10 @@ final class RangeDownloader {
         guard let plan = plan else { return true }
         let appended = Result { try store.append(location, to: plan.state, expected: plan.size) }
         locked {
-            guard var state = states[plan.id] else {
-                // Canceled while appending: leave no partial file behind.
-                store.remove(plan.id)
+            guard var state = states[plan.id], state.generation == plan.state.generation else {
+                // Canceled (or restarted as a new download) while appending:
+                // these bytes belong to no current download.
+                if states[plan.id] == nil { store.remove(plan.id) }
                 return
             }
             guard state.committed == plan.state.committed else {
@@ -607,6 +618,7 @@ final class RangeDownloader {
                 // A promotion or restore may have started another attempt of the
                 // same range meanwhile; these verified bytes make it redundant.
                 if let other = state.pieceTaskId, other != piece.taskId { abandon(other) }
+                state.previousCommitted = state.committed
                 state.committed = committed
                 state.displayed = max(state.displayed, committed)
                 state.pieceTaskId = nil
@@ -697,18 +709,22 @@ final class RangeDownloader {
 
     // MARK: Internals
 
-    /// Starts the next piece, or publishes the file once complete. While the app
-    /// is inactive the piece runs to the end of the file, so iOS schedules one
-    /// discretionary transfer rather than one per piece; after a failure pieces
-    /// stay bounded. Returns false only when the transport refuses the piece.
+    /// Starts the next piece, or publishes the file once complete. Pieces are
+    /// larger while the app is inactive and halve after each failure. Returns
+    /// false only when the transport refuses the piece.
     @discardableResult
     private func startPiece(_ id: String, earliestBegin: Date?) -> Bool {
         guard var state = states[id], !state.halted else { return true }
         let active = isAppActive()
-        // Larger pieces while inactive, bounded so a lost piece costs little;
-        // after a failure pieces return to their normal size.
-        let large = !active && state.retriesRemaining == state.parent.retries
-        guard let range = state.nextPiece(bytes: large ? state.pieceBytes * backgroundPieceMultiplier : nil) else {
+        // Larger pieces while inactive, bounded so a lost piece costs little.
+        // Each consecutive failure halves the piece (down to 1 MiB), so a
+        // provider that cuts often still lets small pieces through; a committed
+        // piece restores the normal size.
+        let failures = state.parent.retries - state.retriesRemaining
+        let large = !active && failures == 0
+        let bytes = large ? state.pieceBytes * backgroundPieceMultiplier
+            : max(state.pieceBytes >> Int64(min(max(failures, 0), 16)), minimumRangePieceBytes)
+        guard let range = state.nextPiece(bytes: bytes) else {
             complete(id)
             return true
         }

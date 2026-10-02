@@ -1,10 +1,9 @@
 # Range-download compatibility patches
 
-This vendored copy remains `background_downloader` 9.5.6. The upstream repository,
-the original fingerprints of the files kept here and the license are preserved in
-`UPSTREAM_PROVENANCE.json` and `LICENSE`. The upstream `example/` app and a stray
-upstream test log are omitted; the IPTV apps do not use them. Never edit the
-global pub cache.
+This branch (`iptv/range-recovery-9.5.6`) is `background_downloader` 9.5.6
+(upstream commit `f522f7d`) plus the IPTV range-download recovery patch. The
+IPTV Flutter apps depend on it by git commit. Upstream files, including
+`example/`, are otherwise unchanged; the git history is the provenance.
 
 Patched files:
 
@@ -59,12 +58,16 @@ destination is replaced and the configured iCloud exclusion applies.
 
 Pieces created while the app is active are 64 MiB. A piece created while the app
 is inactive is four times larger (256 MiB), so iOS, which starts such transfers
-at its discretion, schedules fewer of them while a lost piece stays bounded;
-after a failure pieces return to 64 MiB. Displayed progress never decreases, so
+at its discretion, schedules fewer of them while a lost piece stays bounded.
+Each consecutive failure halves the piece, down to 1 MiB, so a provider that
+cuts often still lets small pieces through; a committed piece restores the
+normal size. Each piece request has a 120 s timeout, so a stalled transfer is
+replaced quickly whatever the session-wide timeout. Displayed progress never decreases, so
 after a lost piece it pauses until the new attempt passes it again. A failed piece is retried with a bounded range after 2, 4,
 8 ... s through `earliestBeginDate`, with no app timer. The parent's `retries`
 budget applies per piece and is refilled after each committed piece. Retries keep
-the parent `running`.
+the parent `running`, and reporting `running` also tells Dart the parent can
+resume.
 
 When a piece exhausts its budget, returns 404, or publication fails, the
 download halts as `failed`/`notFound` but keeps its state and partial file and
@@ -74,7 +77,8 @@ Pause drops only the piece in flight and posts the same marker. Cancel, in any
 state (including a resumed parent still in the holding queue), deletes the state
 and partial file. At app start the app calls
 `retainRangeDownloads` with every tracked record, and native downloads without a
-record are discarded silently.
+record are discarded silently, except downloads started by the current process,
+which Dart may not have recorded yet.
 
 Progress never decreases: the controller keeps the highest displayed byte count,
 sends it as soon as a download continues, and Dart keeps the record's progress
@@ -83,7 +87,10 @@ running, paused, complete, error and canceled states; their Pause and Cancel
 actions are routed to the controller, and Pause is offered while running.
 
 The state is persisted at each piece and every 5 s of progress; states saved by
-earlier versions decode with defaults for fields added since. A `publishing` flag
+earlier versions decode with defaults for fields added since. Each state carries a generation, so bytes appended for a download that was
+canceled and restarted meanwhile are never committed to the new one. If the
+partial file is shorter than the committed length, the commit before the latest
+piece is used. A `publishing` flag
 is saved before the final move: after a termination, a file already at its
 destination completes the download, otherwise publication runs again. Unreadable
 states and partial files without a state are removed at load, and a restored
@@ -106,7 +113,7 @@ after it is released, because posting to Dart can wait for the main thread,
 which may itself need that lock.
 
 `test/native/run_minimal_range_fixtures.sh` compiles the real Task, Auth and
-RangeDownloader sources with a fake transport and runs 123 assertions, including
+RangeDownloader sources with a fake transport and runs 130 assertions, including
 a probe that fails if an event is delivered under the lock. URLSession behavior
 was checked on the iOS 27 simulator against the real provider; physical-device
 background timing still needs device runs.
@@ -156,7 +163,9 @@ transfer, including HTTP 406, whatever the remaining retries, and also a final
 failure or a 404, for a user retry. A response with an invalid range keeps it
 only while retries remain; a changed or weak ETag drops it at once (upstream). The runner republishes the same offset and
 input ETag after a rejected response without altering the file. Cancellation and
-invalid oversized bodies delete owned partial files; cancellation during retry
+invalid oversized bodies delete owned partial files. A pause before any byte
+stays a pause with an empty resume point (resuming starts at byte 0) instead of
+a failure that would be retried automatically; cancellation during retry
 backoff or after a final failure deletes the retained file in Dart, since no
 native runner owns it then. WorkManager, foreground services and the native/Dart
 message format are unchanged.

@@ -25,6 +25,9 @@ final class URLSessionRangeTransport: RangeTransport {
         if taskRequiresWiFi(task: piece) {
             request.allowsCellularAccess = false
         }
+        // A stalled piece must fail quickly so a fresh attempt replaces it; the
+        // session-wide request timeout can be much longer.
+        request.timeoutInterval = 120
         let task = session.downloadTask(with: request)
         task.taskDescription = jsonStringFor(task: piece)
         task.priority = 1 - Float(piece.priority) / 10
@@ -79,9 +82,13 @@ final class URLSessionRangeTransport: RangeTransport {
 /// Reports parent changes through the plugin's normal channels.
 final class PluginRangeEvents: RangeEvents {
     func status(_ parent: Task, _ status: TaskStatus, exception: TaskException?, responseStatusCode: Int?) {
-        if status == .running && parent.allowPause {
-            // Offers the Pause action on the running notification.
-            BDPlugin.propertyLock.withLock { _ = BDPlugin.taskIdsThatCanResume.insert(parent.taskId) }
+        if status == .running {
+            // Range parents can always resume: completes Dart's canResume
+            // completer and offers Pause on the running notification.
+            processCanResume(task: parent, taskCanResume: true)
+            if parent.allowPause {
+                BDPlugin.propertyLock.withLock { _ = BDPlugin.taskIdsThatCanResume.insert(parent.taskId) }
+            }
         }
         processStatusUpdate(task: parent, status: status, taskException: exception, responseStatusCode: responseStatusCode)
     }

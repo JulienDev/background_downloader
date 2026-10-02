@@ -269,6 +269,33 @@ enum MinimalRangeFixtures {
             check(output(h, "resumed") == data, "bytes exact after session resumes")
         }
 
+        // Each consecutive failure halves the piece; a committed piece restores it.
+        do {
+            let h = Harness(directory: root.appendingPathComponent("shrink"))
+            let data = source(20 * mib)
+            h.downloader.start(parent: parent("shrink", size: Int64(20 * mib), piece: Int64(8 * mib)), notificationConfig: nil)
+            check(h.transport.current.headers["Range"] == "bytes=0-\(8 * mib - 1)", "normal piece")
+            _ = h.downloader.handleCompleted(piece: h.transport.current, error: URLError(.networkConnectionLost))
+            check(h.transport.current.headers["Range"] == "bytes=0-\(4 * mib - 1)", "halved after one failure")
+            _ = h.downloader.handleCompleted(piece: h.transport.current, error: URLError(.networkConnectionLost))
+            check(h.transport.current.headers["Range"] == "bytes=0-\(2 * mib - 1)", "halved again")
+            deliver(h, data)
+            check(h.transport.current.headers["Range"] == "bytes=\(2 * mib)-\(10 * mib - 1)", "normal size after a commit")
+            while h.downloader.owns(parentTaskId: "shrink") { deliver(h, data) }
+            check(output(h, "shrink") == data, "bytes exact with shrinking pieces")
+        }
+
+        // An append from a canceled and restarted download is not committed.
+        do {
+            let h = Harness(directory: root.appendingPathComponent("generation"))
+            let task = parent("generation", size: Int64(2 * mib))
+            h.downloader.start(parent: task, notificationConfig: nil)
+            let first = h.downloader.state("generation")!.generation
+            _ = h.downloader.cancel(parentTaskId: "generation")
+            h.downloader.start(parent: task, notificationConfig: nil)
+            check(h.downloader.state("generation")!.generation != first, "restart gets a new generation")
+        }
+
         // Exhausted retries fail the download but keep its bytes for a retry.
         do {
             let h = Harness(directory: root.appendingPathComponent("exhaust"))
@@ -545,8 +572,12 @@ enum MinimalRangeFixtures {
             check(!h.downloader.owns(parentTaskId: "admin-a") && h.downloader.owns(parentTaskId: "admin-c"), "other groups kept")
             let statuses = h.events.statuses.count
             h.downloader.retainOnly(parentTaskIds: [])
-            check(!h.downloader.owns(parentTaskId: "admin-c") && h.store.loadAll().isEmpty, "untracked downloads discarded")
-            check(h.events.statuses.count == statuses, "discarding reports nothing")
+            check(h.downloader.owns(parentTaskId: "admin-c"), "a download started by this process is never discarded")
+            let relaunched = Harness(directory: root.appendingPathComponent("admin"))
+            relaunched.downloader.retainOnly(parentTaskIds: [])
+            check(!relaunched.downloader.owns(parentTaskId: "admin-c") && relaunched.store.loadAll().isEmpty,
+                  "after a relaunch, untracked downloads are discarded")
+            check(h.events.statuses.count == statuses && relaunched.events.statuses.isEmpty, "discarding reports nothing")
         }
 
         // Existing destination is replaced only by a complete, exact file.

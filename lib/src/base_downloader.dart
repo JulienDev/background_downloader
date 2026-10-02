@@ -1218,6 +1218,25 @@ abstract base class BaseDownloader {
             if (expectedFileSize == -1) {
               expectedFileSize = existingRecord.expectedFileSize;
             }
+          } else if (existingRecord != null) {
+            // A final failure replaced the displayed progress with a status
+            // marker but kept the prefix: show it again when the retry starts.
+            final knownSize = expectedFileSize > 0
+                ? expectedFileSize
+                : existingRecord.expectedFileSize;
+            final start = (await getResumeData(task.taskId))?.requiredStartByte;
+            if (knownSize > 0 && start != null && start > 0 && start < knownSize) {
+              progress = start / knownSize;
+              expectedFileSize = knownSize;
+            }
+          }
+        } else if (rangeResume &&
+            expectedFileSize == -1 &&
+            (status == TaskStatus.failed || status == TaskStatus.notFound)) {
+          // Keep the size so a later retry can restore progress from the prefix.
+          final existingRecord = await database.recordForId(task.taskId);
+          if (existingRecord != null) {
+            expectedFileSize = existingRecord.expectedFileSize;
           }
         }
       }

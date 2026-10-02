@@ -84,8 +84,11 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 if (isResume && File(tempFilePath).length() == requiredStartByte) {
                     processResumeData(ResumeData(task, tempFilePath, requiredStartByte, eTag), prefs)
                 } else {
-                    taskException = TaskException(ExceptionType.resume, description = "Paused before a resumable file was created")
-                    result = TaskStatus.failed
+                    // Paused before any byte: stay paused with an empty resume
+                    // point (a failure here would be retried automatically).
+                    // Resuming finds no prefix and starts at byte 0.
+                    Log.i(TAG, "Paused range task ${task.taskId} before any data; resume starts at 0")
+                    processResumeData(ResumeData(task, "", 0, null), prefs)
                 }
             }
             if (result == TaskStatus.canceled ||
