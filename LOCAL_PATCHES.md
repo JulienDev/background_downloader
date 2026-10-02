@@ -186,8 +186,16 @@ invalid oversized bodies delete owned partial files. A pause before any byte
 stays a pause with an empty resume point (resuming starts at byte 0) instead of
 a failure that would be retried automatically; cancellation during retry
 backoff or after a final failure deletes the retained file in Dart, since no
-native runner owns it then. WorkManager, foreground services and the native/Dart
-message format are unchanged.
+native runner owns it then.
+
+When WorkManager stops a marked download because its network constraint is no
+longer met (for example WiFi lost), upstream reported it canceled, deleted the
+partial file and then ran the same work again from byte 0. The runner now keeps
+the validated prefix, records its path in preferences, posts it as ResumeData
+and reports `enqueued`. When WorkManager runs the work again, that prefix takes
+precedence over the work's input resume point (which may be older) and the
+download continues from it. A user cancel still deletes it. Foreground services
+and the native/Dart message format are unchanged.
 
 No additional guarantee is made for process termination, cache eviction or a cold
 launch. The connected suite in `test/native/` runs the real Android plugin on an
