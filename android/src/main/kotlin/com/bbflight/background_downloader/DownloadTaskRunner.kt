@@ -30,12 +30,10 @@ import android.system.ErrnoException
 import kotlin.math.absoluteValue
 import kotlin.random.Random
 
-class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
+/** Prefix of the preference holding a range prefix kept across a system stop. */
+private const val keyStoppedRangePrefix = "com.bbflight.background_downloader.rangeStoppedPrefix."
 
-    private companion object {
-        /** Prefix of the preference holding a range prefix kept across a system stop. */
-        const val keyStoppedRangePrefix = "com.bbflight.background_downloader.rangeStoppedPrefix."
-    }
+class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
     private var eTagHeader: String? = null
     private var serverAcceptsRanges = false // if true, send resume data on fail
