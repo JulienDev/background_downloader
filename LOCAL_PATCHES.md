@@ -69,6 +69,25 @@ budget applies per piece and is refilled after each committed piece. Retries kee
 the parent `running`, and reporting `running` also tells Dart the parent can
 resume.
 
+Prepared pieces cover providers that `nsurlsessiond` cannot reach itself. The
+daemon resolves names with the system DNS, which may block the provider or its
+CDN, and it cannot send a provider-only `Host`. A parent marked
+`rangePrepare: true` resolves the provider redirect in the app before each
+piece: an ephemeral URLSession, which follows the app's DNS settings (its
+encrypted DNS), requests one byte of the piece from the provider URL recorded as
+`rangeSourceUrl` (else the parent URL) and stops at the final response. The
+piece then transfers that final URL at once, without the provider `Host`,
+because its token may expire within seconds. Retry delays elapse before
+resolving, under a background task assertion, for the same reason. A
+preparation failure counts as a piece failure, and 404 is not found. Without the
+marker, a piece that fails with a name resolution error, or a piece started in
+the foreground that receives no response within 45 s (the daemon waits instead
+of failing when it cannot resolve a name), switches the download to prepared
+pieces for good, without consuming a retry. Prepared pieces depend on the app
+running when each piece starts: in the background, iOS may start a prepared
+transfer late, after its token expired; the piece then fails and is prepared
+again.
+
 When a piece exhausts its budget, returns 404, or publication fails, the
 download halts as `failed`/`notFound` but keeps its state and partial file and
 posts a resume marker first. Dart keeps that marker as ResumeData, so a user
@@ -113,7 +132,7 @@ after it is released, because posting to Dart can wait for the main thread,
 which may itself need that lock.
 
 `test/native/run_minimal_range_fixtures.sh` compiles the real Task, Auth and
-RangeDownloader sources with a fake transport and runs 130 assertions, including
+RangeDownloader sources with a fake transport and runs 149 assertions, including
 a probe that fails if an event is delivered under the lock. URLSession behavior
 was checked on the iOS 27 simulator against the real provider; physical-device
 background timing still needs device runs.

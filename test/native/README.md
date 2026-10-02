@@ -7,12 +7,12 @@ The runner compiles the real Task, Auth and RangeDownloader sources with a
 test-only bridge, a fake transport and temporary files. It performs no network
 requests.
 
-The 130 assertions cover markers and piece planning, sequential exact output,
+The 149 assertions cover markers and piece planning, sequential exact output,
 406, ignored-range and transport retries with session-side backoff, session
 resumed pieces, failures that keep their bytes (exhausted budget, 404, refused
 piece) and their retry, pause/resume, cancellation, group cancellation, untracked
 cleanup, WiFi policy restarts, legacy state decoding, restoration after termination (live and lost
-pieces, interrupted and short appends), bounded background pieces, halving after failures, download generations, the moved first piece, interrupted publication, orphaned partial cleanup, foreground
+pieces, interrupted and short appends), bounded background pieces, halving after failures, download generations, the moved first piece, interrupted publication, orphaned partial cleanup, prepared pieces (requested, switched after a name failure or a foreground stall, failed preparation), foreground
 promotion of idle background pieces, safe publication and event delivery outside
 the controller's lock. The URLSession transport, notifications and device
 background timing require simulator or iPhone integration runs.

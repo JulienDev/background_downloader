@@ -32,6 +32,11 @@ import kotlin.random.Random
 
 class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
+    private companion object {
+        /** Prefix of the preference holding a range prefix kept across a system stop. */
+        const val keyStoppedRangePrefix = "com.bbflight.background_downloader.rangeStoppedPrefix."
+    }
+
     private var eTagHeader: String? = null
     private var serverAcceptsRanges = false // if true, send resume data on fail
     private var tempFilePath = ""
@@ -79,6 +84,12 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         }
         try {
             var result = super.connectAndProcess(connection)
+            if (rangeTotal != null && result == TaskStatus.canceled && context.isTaskStopped &&
+                !BDPlugin.canceledTaskIds.contains(task.taskId)) {
+                // Stopped by the system (lost WiFi or network constraint), not by
+                // the user: WorkManager runs this work again later.
+                result = keepPrefixForSystemRestart()
+            }
             if (rangeTotal != null && result == TaskStatus.paused && !rangeBodyStarted) {
                 BDPlugin.pausedTaskIds.remove(task.taskId)
                 if (isResume && File(tempFilePath).length() == requiredStartByte) {
@@ -501,7 +512,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         // set tempFilePath from resume data, or "" if a new tempFile is needed
         requiredStartByte = context.getInputLong(keyStartByte, 0)
         if (requiredStartByte == 0L) {
-            return false
+            return resumeAfterSystemStop()
         }
         eTag = context.getInputString(keyETag)
         tempFilePath = if (requiredStartByte > 0) context.getInputString(keyResumeDataData) ?: ""
@@ -607,6 +618,49 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             return false
         }
         return true
+    }
+
+    /**
+     * Keeps a validated prefix when the system stops the work: WorkManager runs
+     * the same work again with its original input, which [resumeAfterSystemStop]
+     * completes with the prefix recorded here. Reports [TaskStatus.enqueued]
+     * rather than canceled, since the download continues by itself.
+     */
+    private suspend fun keepPrefixForSystemRestart(): TaskStatus {
+        val total = rangeTotal ?: return TaskStatus.canceled
+        val file = File(tempFilePath)
+        val length = file.length()
+        val validPrefix = if (rangeBodyStarted) !invalidRangeBody && length == startByte + bytesTotal
+            else isResume && length == requiredStartByte
+        if (tempFilePath.isNotEmpty() && file.isFile && length in 1 until total && validPrefix) {
+            prefs.edit().putString(keyStoppedRangePrefix + task.taskId, tempFilePath).apply()
+            val retainedETag = if (rangeBodyStarted) eTagHeader else eTag
+            processResumeData(ResumeData(task, tempFilePath, length, retainedETag), prefs)
+            Log.i(TAG, "Range task ${task.taskId} stopped by the system; keeping $tempFilePath at $length of $total")
+        } else {
+            Log.i(TAG, "Range task ${task.taskId} stopped by the system without a valid prefix (length=$length)")
+            deleteTempFile()
+        }
+        return TaskStatus.enqueued
+    }
+
+    /** Continues from the prefix kept by [keepPrefixForSystemRestart], if any. */
+    private fun resumeAfterSystemStop(): Boolean {
+        val total = rangeTotal ?: return false
+        val key = keyStoppedRangePrefix + task.taskId
+        val path = prefs.getString(key, null) ?: return false
+        prefs.edit().remove(key).apply()
+        val file = File(path)
+        if (file.isFile && file.length() in 1 until total) {
+            tempFilePath = path
+            requiredStartByte = file.length()
+            eTag = null
+            Log.i(TAG, "Resuming range task ${task.taskId} after a system stop from $path at $requiredStartByte")
+            return true
+        }
+        Log.i(TAG, "Cannot resume range task ${task.taskId} after a system stop: $path length=${file.length()}")
+        file.delete()
+        return false
     }
 
     /**
