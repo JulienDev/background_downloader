@@ -33,6 +33,9 @@ import kotlin.random.Random
 /** Prefix of the preference holding a range prefix kept across a system stop. */
 private const val keyStoppedRangePrefix = "com.bbflight.background_downloader.rangeStoppedPrefix."
 
+/** Smallest range piece, whatever the app requests (as on iOS). */
+private const val minimumRangePieceBytes = 1L shl 20
+
 class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
 
     private var eTagHeader: String? = null
@@ -62,14 +65,36 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         }
     }
 
+    // Bounded pieces requested by the app (`rangePieceBytes`), null for a single
+    // open-ended request. Each piece is a new request to the task URL, so a
+    // provider that slows down long responses serves every piece at full speed.
+    private val rangePieceBytes: Long? by lazy {
+        if (rangeTotal == null) null
+        else {
+            val metadata = Json.parseToJsonElement(task.metaData) as JsonObject
+            (metadata["rangePieceBytes"] as? JsonPrimitive)?.content?.toLongOrNull()
+                ?.coerceAtLeast(minimumRangePieceBytes)
+        }
+    }
+
+    /** Last byte of the range requested from [start]: its piece, or the whole file. */
+    private fun rangeEnd(start: Long, total: Long): Long {
+        val piece = rangePieceBytes ?: return total - 1
+        return minOf(start + piece, total) - 1
+    }
+
     /**
      * Make the request to the [connection] and process the [Task]
      *
      * Returns the [TaskStatus]
      * */
     override suspend fun connectAndProcess(connection: HttpURLConnection): TaskStatus {
-        if (rangeTotal != null) {
-            connection.setRequestProperty("Range", "bytes=${if (isResume) requiredStartByte else 0}-")
+        val total = rangeTotal
+        if (total != null) {
+            val start = if (isResume) requiredStartByte else 0
+            // Without pieces, the request stays open-ended as before.
+            val end = if (rangePieceBytes == null) "" else "${rangeEnd(start, total)}"
+            connection.setRequestProperty("Range", "bytes=$start-$end")
             connection.setRequestProperty("Accept-Encoding", "identity")
             Log.i(TAG, "Range request ${task.taskId}: ${task.url}, headers=${connection.requestProperties}")
         } else if (isResume) {
@@ -150,7 +175,10 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             if (UriUtils.containsUri(task.directory) || UriUtils.containsUri(task.filename)) {
                 throw IOException("Range recovery requires a file destination: ${task.directory}/${task.filename}")
             }
-            if (connection.responseCode in 200..206) validateRangeResponse(connection, total)
+            if (connection.responseCode in 200..206) {
+                val start = if (isResume) requiredStartByte else 0L
+                validateRangeResponse(connection, start, rangeEnd(start, total), total)
+            }
         }
         if (connection.responseCode in 200..206) {
             // determine if we are using Uri or not.  Uri means pause/resume not allowed
@@ -316,7 +344,7 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
             determineRunInForeground(task, contentLength) // sets 'runInForeground'
             context.updateEstimatedNetworkBytes(contentLength, 0L)
             // transfer the bytes from the server to the output stream
-            val transferBytesResult: TaskStatus
+            var transferBytesResult = TaskStatus.failed
             if (total == null) {
                 BufferedInputStream(connection.inputStream).use { inputStream ->
                     transferBytesResult = transferBytes(inputStream, outputStream, contentLength, task)
@@ -325,21 +353,57 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
                 outputStream.close()
             } else {
                 rangeBodyStarted = true
+                // Last byte of the current piece (of the file without pieces).
+                var rangeEndByte = rangeEnd(startByte, total)
                 // Reject excess bytes before writing them into a reusable prefix.
                 val checkedOutput = object : FilterOutputStream(outputStream) {
                     override fun write(buffer: ByteArray, offset: Int, length: Int) {
-                        if (length.toLong() > contentLength - bytesTotal) {
+                        if (length.toLong() > rangeEndByte + 1 - startByte - bytesTotal) {
                             invalidRangeBody = true
-                            throw IOException("Range body exceeds $contentLength bytes for ${task.url}")
+                            throw IOException("Range body exceeds byte $rangeEndByte for ${task.url}")
                         }
                         out.write(buffer, offset, length)
                     }
                 }
-                checkedOutput.use { output ->
-                    BufferedInputStream(connection.inputStream).use { input ->
-                        transferBytesResult = transferBytes(input, output, contentLength, task)
+                var pieceConnection = connection
+                try {
+                    checkedOutput.use { output ->
+                        while (true) {
+                            BufferedInputStream(pieceConnection.inputStream).use { input ->
+                                transferBytesResult = transferBytes(input, output, contentLength, task)
+                            }
+                            val received = startByte + bytesTotal
+                            if (transferBytesResult != TaskStatus.complete || rangePieceBytes == null ||
+                                received == total) {
+                                break
+                            }
+                            if (received != rangeEndByte + 1) {
+                                throw IOException("Range piece ended at byte $received instead of ${rangeEndByte + 1} for ${task.url}")
+                            }
+                            // Between pieces no transfer watches for these signals.
+                            if (BDPlugin.canceledTaskIds.contains(task.taskId)) {
+                                transferBytesResult = TaskStatus.canceled
+                                break
+                            }
+                            if (context.isTaskStopped) {
+                                // Reported like a stop during a transfer: canceled, then kept for
+                                // WorkManager's next run in connectAndProcess.
+                                throw IOException("Range task ${task.taskId} stopped between pieces at byte $received")
+                            }
+                            if (BDPlugin.pausedTaskIds.contains(task.taskId)) {
+                                transferBytesResult = TaskStatus.paused
+                                break
+                            }
+                            rangeEndByte = rangeEnd(received, total)
+                            // One connection at a time: the next piece starts after this one ends.
+                            pieceConnection.disconnect()
+                            pieceConnection = requestRangePiece(received, rangeEndByte, total)
+                                ?: return if (responseStatusCode == 404) TaskStatus.notFound else TaskStatus.failed
+                        }
+                        output.flush()
                     }
-                    output.flush()
+                } finally {
+                    if (pieceConnection !== connection) pieceConnection.disconnect()
                 }
             }
             // act on the result of the bytes transfer
@@ -703,16 +767,52 @@ class DownloadTaskRunner(context: TaskJobContext) : TaskRunner(context) {
         }
     }
 
+    /**
+     * Requests the piece [start]..[end] from the task URL on a new connection,
+     * configured like the first request, so a provider redirect is resolved
+     * again for each piece. Returns the connection once its response is
+     * validated, or null after an HTTP error, with [responseStatusCode] and
+     * [taskException] set.
+     *
+     * Unlike a resume, a piece is not compared with the first response's ETag:
+     * each redirect may lead to another CDN node, as with iOS pieces.
+     */
+    private suspend fun requestRangePiece(start: Long, end: Long, total: Long): HttpURLConnection? {
+        val connection = openTaskConnection()
+        activeConnection = connection
+        connection.setRequestProperty("Range", "bytes=$start-$end")
+        connection.setRequestProperty("Accept-Encoding", "identity")
+        Log.i(TAG, "Range piece request ${task.taskId}: ${task.url}, headers=${connection.requestProperties}")
+        responseStatusCode = connection.responseCode
+        Log.i(TAG, "Range piece response ${task.taskId}: ${connection.url}, status=$responseStatusCode, headers=${connection.headerFields}")
+        if (connection.responseCode !in 200..206) {
+            val errorContent = responseErrorContent(connection)
+            taskException = TaskException(
+                ExceptionType.httpResponse, httpResponseCode = connection.responseCode,
+                description = if (errorContent?.isNotEmpty() == true) errorContent else connection.responseMessage
+            )
+            if (connection.responseCode == 404) responseBody = errorContent
+            connection.disconnect()
+            return null
+        }
+        try {
+            validateRangeResponse(connection, start, end, total)
+        } catch (e: IOException) {
+            connection.disconnect()
+            throw e
+        }
+        return connection
+    }
+
     /** A rejected response must never alter an already validated prefix. */
-    private fun validateRangeResponse(connection: HttpURLConnection, total: Long) {
-        val offset = if (isResume) requiredStartByte else 0L
-        val expectedRange = "bytes $offset-${total - 1}/$total"
+    private fun validateRangeResponse(connection: HttpURLConnection, start: Long, end: Long, total: Long) {
+        val expectedRange = "bytes $start-$end/$total"
         val contentRange = rangeHeader(connection, "Content-Range")
         val encoding = rangeHeader(connection, "Content-Encoding")
         val length = rangeHeader(connection, "Content-Length")
         if (connection.responseCode != 206 || contentRange != expectedRange ||
             (encoding != null && !encoding.equals("identity", ignoreCase = true)) ||
-            (length != null && length.toLongOrNull() != total - offset)) {
+            (length != null && length.toLongOrNull() != end + 1 - start)) {
             rejectedRangeResponse = true
             throw IOException("Invalid range response for ${task.url}: status=${connection.responseCode}, Content-Range=$contentRange, Content-Encoding=$encoding, Content-Length=$length, expected=$expectedRange")
         }

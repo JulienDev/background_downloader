@@ -569,42 +569,9 @@ open class TaskRunner(
      */
     private suspend fun doTask(): TaskStatus {
         try {
-            val urlString = task.url
-            val url = URL(urlString)
-            val requestTimeoutSeconds =
-                prefs.getInt(BDPlugin.keyConfigRequestTimeout, 60)
-            val proxyAddress =
-                prefs.getString(BDPlugin.keyConfigProxyAddress, null)
-            val proxyPort = prefs.getInt(BDPlugin.keyConfigProxyPort, 0)
-            val proxy = if (proxyAddress != null && proxyPort != 0) Proxy(
-                Proxy.Type.HTTP,
-                InetSocketAddress(proxyAddress, proxyPort)
-            ) else null
-            if (!BDPlugin.haveLoggedProxyMessage) {
-                Log.i(
-                    TAG,
-                    if (proxy == null) "Not using proxy for any task"
-                    else "Using proxy $proxyAddress:$proxyPort for all tasks"
-                )
-                BDPlugin.haveLoggedProxyMessage = true
-            }
-            with(withContext(Dispatchers.IO) {
-                url.openConnection(proxy ?: Proxy.NO_PROXY)
-            } as HttpURLConnection) {
+            with(openTaskConnection()) {
                 activeConnection = this
                 try {
-                    requestMethod = task.httpRequestMethod
-                    connectTimeout = requestTimeoutSeconds * 1000
-                    for (header in task.headers) {
-                        // For UploadTask, copy headers unless it's "Range" or "Content-Disposition".
-                        // For other task types, copy all headers.
-                        if (!task.isUploadTask() ||
-                            (!header.key.equals("Range", ignoreCase = true) &&
-                                    !header.key.equals("Content-Disposition", ignoreCase = true))
-                        ) {
-                            setRequestProperty(header.key, header.value)
-                        }
-                    }
                     return connectAndProcess(this)
                 } finally {
                     activeConnection = null
@@ -617,6 +584,50 @@ open class TaskRunner(
             setTaskException(e)
         }
         return TaskStatus.failed
+    }
+
+    /**
+     * Creates a connection to the task URL (not yet connected) with the
+     * configured proxy and request timeout, the task's method and its headers.
+     *
+     * Local patch: range downloads open one per piece, configured like the
+     * first request.
+     */
+    suspend fun openTaskConnection(): HttpURLConnection {
+        val url = URL(task.url)
+        val requestTimeoutSeconds =
+            prefs.getInt(BDPlugin.keyConfigRequestTimeout, 60)
+        val proxyAddress =
+            prefs.getString(BDPlugin.keyConfigProxyAddress, null)
+        val proxyPort = prefs.getInt(BDPlugin.keyConfigProxyPort, 0)
+        val proxy = if (proxyAddress != null && proxyPort != 0) Proxy(
+            Proxy.Type.HTTP,
+            InetSocketAddress(proxyAddress, proxyPort)
+        ) else null
+        if (!BDPlugin.haveLoggedProxyMessage) {
+            Log.i(
+                TAG,
+                if (proxy == null) "Not using proxy for any task"
+                else "Using proxy $proxyAddress:$proxyPort for all tasks"
+            )
+            BDPlugin.haveLoggedProxyMessage = true
+        }
+        val connection = withContext(Dispatchers.IO) {
+            url.openConnection(proxy ?: Proxy.NO_PROXY)
+        } as HttpURLConnection
+        connection.requestMethod = task.httpRequestMethod
+        connection.connectTimeout = requestTimeoutSeconds * 1000
+        for (header in task.headers) {
+            // For UploadTask, copy headers unless it's "Range" or "Content-Disposition".
+            // For other task types, copy all headers.
+            if (!task.isUploadTask() ||
+                (!header.key.equals("Range", ignoreCase = true) &&
+                        !header.key.equals("Content-Disposition", ignoreCase = true))
+            ) {
+                connection.setRequestProperty(header.key, header.value)
+            }
+        }
+        return connection
     }
 
     /**

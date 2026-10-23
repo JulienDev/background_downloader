@@ -13,7 +13,8 @@ Patched files:
   `WiFi.swift`. `ParallelDownloader.swift` is upstream.
 - macOS/Windows: `lib/src/desktop/download_isolate.dart` and
   `lib/src/desktop/desktop_downloader.dart`.
-- Android: `android/src/main/kotlin/com/bbflight/background_downloader/DownloadTaskRunner.kt`.
+- Android: `android/src/main/kotlin/com/bbflight/background_downloader/DownloadTaskRunner.kt`
+  and `TaskRunner.kt` (`openTaskConnection`, which also opens each range piece).
 - Shared Dart: `lib/src/base_downloader.dart` (progress preservation, retry
   budget, retained failures, cancellation), `lib/src/chunk.dart`,
   `lib/src/native_downloader.dart` and `lib/src/file_downloader.dart`
@@ -29,6 +30,12 @@ a reused token returns HTTP 406. Its `Accept-Ranges` header is malformed
 (`0-<size>`), HEAD returns no length, and there is no ETag or Last-Modified.
 Recovery therefore always restarts from the provider URL, so each attempt gets a
 fresh redirect, and requests an exact byte range validated by the response.
+
+Providers also slow down long responses: on 2026-10-22 one served about 330 MB
+of a 1.1 GB catch-up programme at 15-30 MB/s on a single connection, then
+1.0 MB/s until the end (over 13 minutes), while iOS pieces, each a new request,
+took 30-50 s. Every platform therefore downloads in bounded pieces, one request
+at a time, since these accounts allow a single connection.
 
 ## iOS
 
@@ -146,6 +153,24 @@ path even when Accept-Ranges is malformed. Both platforms use `DesktopDownloader
 and this patched Dart engine; Windows drive-letter and UNC destinations continue
 through the plugin's existing path handling.
 
+With `rangePieceBytes` (64 MiB from the app, at least 1 MiB), one run of the
+task requests the file in bounded pieces, `bytes=start-end`, one after another.
+Each piece is a new request (`Connection: close`) to the task URL, so the
+provider redirect is resolved again, and starts only after the previous body
+ended. Every piece response is validated like the first (exact 206, Content-Range
+start, end and total, identity encoding, matching Content-Length) before its
+body is read, and its body cannot exceed the piece. Bytes are appended to the
+same partial file, so a failed piece keeps everything received: a cut, a short
+piece, an HTTP error or a transport error fails the task with that prefix as
+ResumeData, and the retry starts a bounded piece at the exact offset. A 404 of a
+later piece keeps the prefix too. A piece that contradicts the prefix keeps it
+only while retries remain. Pause or cancel between pieces leaves the next body
+unread. Unlike a resume, a piece is not compared with the first response's ETag,
+because each redirect may lead to another CDN node (iOS pieces ignore it too).
+Progress and the retry budget cover the whole file. A task without
+`rangePieceBytes` (enqueued by an earlier app version) keeps one open-ended
+request.
+
 Marked responses require an exact 206/Content-Range start, end and total,
 identity encoding, and Content-Length when present. The body cannot exceed the
 remaining length, and the final file must contain exactly N bytes before
@@ -177,6 +202,23 @@ Content-Range start/end/total, identity encoding and a matching Content-Length
 when present. Body writes reject surplus bytes; publication requires the exact
 probed total size. Existing strong ETag checks still apply on resume.
 
+With `rangePieceBytes` (64 MiB from the app, at least 1 MiB), the runner
+requests bounded pieces, `bytes=start-end`, one after another within one run of
+the work. Each piece opens a new connection to the task URL, configured like the
+first request (`openTaskConnection`: proxy, timeout, method and headers), so the
+provider redirect is resolved again; it starts only after the previous piece's
+body ended and its connection was released. Each piece response is validated
+like the first, writes stop at the piece's last byte, and a piece that ends
+early fails. All bytes go to the same partial file: a failure of any piece
+(cut, short body, HTTP 406, transport error) keeps the validated prefix through
+the rules below, a 404 keeps it for a user retry, and the retry starts a bounded
+piece at the exact offset. Between pieces, a user pause posts the prefix as
+ResumeData, a cancel deletes it, and a system stop keeps it for WorkManager's
+next run, as during a transfer. A piece is not compared with the first
+response's ETag: each redirect may lead to another CDN node, as on iOS. Progress
+and notifications cover the whole file. A task without `rangePieceBytes` keeps
+one open-ended request. URI destinations are unchanged (classic path).
+
 A valid partial file survives cuts, short bodies and errors before body
 transfer, including HTTP 406, whatever the remaining retries, and also a final
 failure or a 404, for a user retry. A response with an invalid range keeps it
@@ -199,7 +241,7 @@ and the native/Dart message format are unchanged.
 
 No additional guarantee is made for process termination, cache eviction or a cold
 launch. The connected suite in `test/native/` runs the real Android plugin on an
-emulator; physical-device timing remains unverified.
+emulator, pieces included; physical-device timing remains unverified.
 
 ## Retry budget, retained failures and cancellation (shared Dart)
 
@@ -215,4 +257,5 @@ enqueuing it from byte 0. Cancelling such a failed Android/desktop task deletes 
 Dart after the platform cancellation; paused or failed iOS range parents are
 always cancelled by the platform, which owns their bytes. Unmarked tasks keep
 the upstream behavior. `common/test/download/range_retry_budget_test.dart` in
-the Flutter repository covers these rules.
+the Flutter repository covers these rules; `desktop_range_resume_test.dart` and
+`desktop_range_pieces_test.dart` there run the desktop engine itself.

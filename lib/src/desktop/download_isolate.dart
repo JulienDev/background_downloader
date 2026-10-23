@@ -38,21 +38,40 @@ int? rangeResumeTotal(DownloadTask task) {
   return total;
 }
 
+/// Smallest range piece, whatever the app requests (as on iOS).
+const minimumRangePieceBytes = 1 << 20;
+
+/// Bounded pieces requested by the app (`rangePieceBytes`) for a marked task,
+/// null for a single open-ended request. Each piece is a new request to the
+/// task URL, so a provider that slows down long responses serves every piece
+/// at full speed.
+int? rangePieceBytes(DownloadTask task) {
+  final metadata = jsonDecode(task.metaData);
+  final value = int.tryParse('${metadata['rangePieceBytes']}');
+  return value == null ? null : max(value, minimumRangePieceBytes);
+}
+
+/// Last byte of the range requested from [start]: its piece of [pieceBytes],
+/// or the whole file.
+int rangeEnd(int start, int total, int? pieceBytes) =>
+    pieceBytes == null ? total - 1 : min(start + pieceBytes, total) - 1;
+
 void validateRangeResumeResponse(
   http.StreamedResponse response,
   int start,
+  int end,
   int total,
 ) {
   final range = response.headers['content-range'];
   final encoding = response.headers['content-encoding'];
   final length = response.headers['content-length'];
   if (response.statusCode != 206 ||
-      range?.trim().toLowerCase() != 'bytes $start-${total - 1}/$total' ||
+      range?.trim().toLowerCase() != 'bytes $start-$end/$total' ||
       (encoding != null && encoding.trim().toLowerCase() != 'identity') ||
-      (length != null && int.tryParse(length) != total - start)) {
+      (length != null && int.tryParse(length) != end + 1 - start)) {
     throw TaskResumeException(
       'Invalid range resume response: status=${response.statusCode}, '
-      'headers=${response.headers}, expected=bytes $start-${total - 1}/$total',
+      'headers=${response.headers}, expected=bytes $start-$end/$total',
     );
   }
 }
@@ -88,7 +107,9 @@ Future<void> doDownloadTask(
       isResume &&
       await determineIfResumeIsPossible(tempFilePath, requiredStartByte);
   final rangeTotal = rangeResumeTotal(downloadTask);
+  final pieceBytes = rangeTotal == null ? null : rangePieceBytes(downloadTask);
   final validResume = isResume;
+  final rangeStart = validResume ? requiredStartByte : 0;
   var processedBody = false;
   // The server answered with a range or identity contradicting the prefix.
   var rejectedRangeResponse = false;
@@ -109,9 +130,33 @@ Future<void> doDownloadTask(
     final newRangeString = 'bytes=${resumeRange.$1}-${resumeRange.$2 ?? ""}';
     request.headers['Range'] = newRangeString;
   }
+  if (rangeTotal != null && pieceBytes != null) {
+    request.headers['Range'] =
+        'bytes=$rangeStart-${rangeEnd(rangeStart, rangeTotal, pieceBytes)}';
+  }
   if (downloadTask.post case String post) {
     request.body = post;
   }
+
+  // Requests the next piece on a new connection, configured like the first
+  // request, so a provider redirect is resolved again for each piece.
+  Future<http.StreamedResponse> requestRangePiece(int start, int end) {
+    final pieceRequest = http.Request(
+      downloadTask.httpRequestMethod,
+      Uri.parse(downloadTask.url),
+    );
+    pieceRequest.headers.addAll(downloadTask.headers);
+    pieceRequest.headers['Range'] = 'bytes=$start-$end';
+    pieceRequest.persistentConnection = false;
+    if (downloadTask.post case String post) {
+      pieceRequest.body = post;
+    }
+    log.fine(
+      'Range piece request ${pieceRequest.url} headers=${pieceRequest.headers}',
+    );
+    return client.send(pieceRequest);
+  }
+
   var resultStatus = TaskStatus.failed;
   try {
     if (rangeTotal != null && requiredStartByte >= rangeTotal) {
@@ -136,7 +181,8 @@ Future<void> doDownloadTask(
           try {
             validateRangeResumeResponse(
               response,
-              validResume ? requiredStartByte : 0,
+              rangeStart,
+              rangeEnd(rangeStart, rangeTotal, pieceBytes),
               rangeTotal,
             );
           } catch (_) {
@@ -189,9 +235,9 @@ Future<void> doDownloadTask(
           sendPort,
           rangeTotal: rangeTotal,
           expectedBodyLength:
-              rangeTotal == null
-                  ? null
-                  : rangeTotal - (validResume ? requiredStartByte : 0),
+              rangeTotal == null ? null : rangeTotal - rangeStart,
+          pieceBytes: pieceBytes,
+          requestRangePiece: requestRangePiece,
         );
       } else {
         // not an OK response
@@ -277,6 +323,8 @@ Future<TaskStatus> processOkDownloadResponse(
   SendPort sendPort, {
   int? rangeTotal,
   int? expectedBodyLength,
+  int? pieceBytes,
+  Future<http.StreamedResponse> Function(int start, int end)? requestRangePiece,
 }) async {
   // contentLength is extracted from response header, and if not available
   // we attempt to extract from [Task.headers], allowing developer to
@@ -291,6 +339,8 @@ Future<TaskStatus> processOkDownloadResponse(
   var resultStatus = TaskStatus.failed;
   var actualTempFilePath = tempFilePath;
   var invalidRangeBody = false;
+  // A later piece answered with a range or identity contradicting the prefix.
+  var rejectedRangePiece = false;
   IOSink? outStream;
   try {
     // do the actual download
@@ -314,28 +364,101 @@ Future<TaskStatus> processOkDownloadResponse(
         rethrow;
       }
     }
-    Stream<List<int>> inStream = response.stream;
-    if (expectedBodyLength != null) {
-      var received = 0;
-      inStream = inStream.map((bytes) {
-        received += bytes.length;
-        if (received > expectedBodyLength) {
-          invalidRangeBody = true;
-          throw TaskResumeException(
-            'Range body too long: received $received, expected $expectedBodyLength',
+    // Marked tasks: last byte of the current piece (of the file without pieces).
+    var rangeEndByte =
+        rangeTotal == null ? null : rangeEnd(startByte, rangeTotal, pieceBytes);
+    var pieceResponse = response;
+    TaskStatus transferBytesResult;
+    while (true) {
+      Stream<List<int>> inStream = pieceResponse.stream;
+      if (rangeEndByte != null) {
+        final expected = rangeEndByte + 1 - startByte - bytesTotal;
+        var received = 0;
+        inStream = inStream.map((bytes) {
+          received += bytes.length;
+          if (received > expected) {
+            invalidRangeBody = true;
+            throw TaskResumeException(
+              'Range body too long: received $received, expected $expected',
+            );
+          }
+          return bytes;
+        });
+      }
+      transferBytesResult = await transferBytes(
+        inStream,
+        outStream,
+        contentLength,
+        downloadTask,
+        sendPort,
+        requestTimeout,
+      );
+      final received = startByte + bytesTotal;
+      if (transferBytesResult != TaskStatus.complete ||
+          pieceBytes == null ||
+          rangeTotal == null ||
+          rangeEndByte == null ||
+          received == rangeTotal) {
+        break;
+      }
+      if (received != rangeEndByte + 1) {
+        throw TaskResumeException(
+          'Range piece ended at byte $received instead of ${rangeEndByte + 1}',
+        );
+      }
+      // Between pieces no transfer watches for these signals.
+      if (isCanceled) {
+        transferBytesResult = TaskStatus.canceled;
+        break;
+      }
+      if (isPaused) {
+        transferBytesResult = TaskStatus.paused;
+        break;
+      }
+      // One connection at a time: the next piece starts after this one ends.
+      rangeEndByte = rangeEnd(received, rangeTotal, pieceBytes);
+      pieceResponse = await requestRangePiece!(received, rangeEndByte);
+      log.fine(
+        'Range piece response ${downloadTask.url} '
+        'status=${pieceResponse.statusCode} headers=${pieceResponse.headers}',
+      );
+      responseStatusCode = pieceResponse.statusCode;
+      if (isCanceled || isPaused) {
+        await pieceResponse.stream.listen(null).cancel();
+        transferBytesResult =
+            isCanceled ? TaskStatus.canceled : TaskStatus.paused;
+        break;
+      }
+      if (!okResponses.contains(pieceResponse.statusCode)) {
+        responseBody = await responseContent(pieceResponse);
+        if (pieceResponse.statusCode == 404) {
+          transferBytesResult = TaskStatus.notFound;
+        } else {
+          taskException = TaskHttpException(
+            responseBody?.isNotEmpty == true
+                ? responseBody!
+                : pieceResponse.reasonPhrase ?? 'Invalid HTTP Request',
+            pieceResponse.statusCode,
           );
+          transferBytesResult = TaskStatus.failed;
         }
-        return bytes;
-      });
+        break;
+      }
+      // Unlike a resume, a piece is not compared with the first response's
+      // ETag: each redirect may lead to another CDN node, as with iOS pieces.
+      try {
+        validateRangeResumeResponse(
+          pieceResponse,
+          received,
+          rangeEndByte,
+          rangeTotal,
+        );
+      } catch (_) {
+        rejectedRangePiece = true;
+        await pieceResponse.stream.listen(null).cancel();
+        rethrow;
+      }
     }
-    final transferBytesResult = await transferBytes(
-      inStream,
-      outStream,
-      contentLength,
-      downloadTask,
-      sendPort,
-      requestTimeout,
-    );
     switch (transferBytesResult) {
       case TaskStatus.complete:
         // copy file to destination, creating dirs if needed
@@ -375,6 +498,9 @@ Future<TaskStatus> processOkDownloadResponse(
       case TaskStatus.failed:
         break;
 
+      case TaskStatus.notFound:
+        resultStatus = TaskStatus.notFound;
+
       default:
         throw ArgumentError('Cannot process $transferBytesResult');
     }
@@ -390,16 +516,19 @@ Future<TaskStatus> processOkDownloadResponse(
           rangeTotal != null && await File(actualTempFilePath).exists()
               ? await File(actualTempFilePath).length()
               : bytesTotal + startByte;
-      if (resultStatus == TaskStatus.failed &&
+      if ((resultStatus == TaskStatus.failed ||
+              (rangeTotal != null && resultStatus == TaskStatus.notFound)) &&
           serverAcceptsRanges &&
           (rangeTotal == null
               ? partialLength > 1 << 20
               // Marked tasks keep any valid prefix, whatever the remaining
               // retries: Dart refills the budget after progress and keeps the
-              // ResumeData after a final failure.
+              // ResumeData after a final failure (or a 404 of a later piece).
+              // A final piece contradicting the prefix drops it.
               : !invalidRangeBody &&
-                    partialLength > 0 &&
-                    partialLength < rangeTotal)) {
+                  !(rejectedRangePiece && downloadTask.retriesRemaining <= 0) &&
+                  partialLength > 0 &&
+                  partialLength < rangeTotal)) {
         // send ResumeData to allow resume after fail
         sendPort.send((
           'resumeData',

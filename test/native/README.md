@@ -41,7 +41,11 @@ offsets and progress, exact output bytes, pause/resume, rejected statuses/ranges
 encoding/length, short and surplus bodies, ETag changes, cancellation, a cut on
 the last retry after progress (budget refill), prefixes kept after a final 406 or
 a 404 and removed by cancel, a user retry continuing from the kept prefix, and an
-unmarked control. Journals, logcat, source fingerprints and
+unmarked control. Tasks marked with `rangePieceBytes` (1 MiB pieces of the 8 MiB
+file) also cover bounded requests one at a time, each from the origin with a
+fresh redirect, a cut piece then 406, a short piece, a later piece answered with
+the rest of the file, a surplus piece, a 404 piece, and pause and cancellation
+during pieces. Journals, logcat, source fingerprints and
 APK proofs are retained. The exact publication/cancellation race is also guarded
 in native source; these fixtures do not inject a production-only timing hook.
 Emulator tests do not prove physical-device background timing, process death or

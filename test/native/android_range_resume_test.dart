@@ -16,6 +16,7 @@ import 'package:path_provider/path_provider.dart';
 
 const _total = 8 * 1024 * 1024;
 const _cut = 3 * 1024 * 1024 + 37;
+const _piece = 1024 * 1024;
 const _group = 'android-range-fixtures';
 const _timeout = Timeout(Duration(minutes: 2));
 final _payload = Uint8List.fromList(
@@ -53,6 +54,11 @@ class _Fixture {
   var token = 0;
   var bodyAttempts = 0;
   var bodyAllSent = false;
+  // Media bodies whose last byte has not been queued yet: a client that waits
+  // for each piece never sends the next request while one is open.
+  var openBodies = 0;
+  // Piece modes fail one offset once, then serve it normally.
+  final failedOnce = <int>{};
   final origins = <Map<String, Object?>>[];
   final responses = <Map<String, Object?>>[];
 
@@ -62,10 +68,14 @@ class _Fixture {
     final headers = <String, List<String>>{};
     request.headers.forEach((name, values) => headers[name] = values);
     final range = request.headers.value(HttpHeaders.rangeHeader);
-    final start =
-        range == null
-            ? 0
-            : int.parse(RegExp(r'^bytes=(\d+)-').firstMatch(range)!.group(1)!);
+    final rangeMatch =
+        range == null ? null : RegExp(r'^bytes=(\d+)-(\d*)').firstMatch(range);
+    final start = rangeMatch == null ? 0 : int.parse(rangeMatch.group(1)!);
+    // Bounded pieces ask for an end; the original requests are open-ended.
+    final requestedEnd =
+        rangeMatch == null || rangeMatch.group(2)!.isEmpty
+            ? null
+            : int.parse(rangeMatch.group(2)!);
     _log('httpRequest', {
       'fixture': name,
       'method': request.method,
@@ -83,7 +93,9 @@ class _Fixture {
       final origin = <String, Object?>{
         'range': range,
         'start': start,
+        'end': requestedEnd,
         'token': ++token,
+        'openBodies': openBodies,
       };
       origins.add(origin);
       request.response.statusCode = HttpStatus.found;
@@ -103,9 +115,19 @@ class _Fixture {
     response.headers.set(HttpHeaders.contentTypeHeader, 'video/x-matroska');
     var status = HttpStatus.partialContent;
     var rangeStart = start;
-    var rangeEnd = _total - 1;
+    // Last byte served: the requested piece, else the end of the file.
+    var servedEnd =
+        requestedEnd == null || requestedEnd >= _total
+            ? _total - 1
+            : requestedEnd;
+    if (mode == 'pieceOpenEnded' && start > 0) {
+      // A server that honors bytes=0-0 but answers later bounded ranges with
+      // the rest of the file.
+      servedEnd = _total - 1;
+    }
+    var rangeEnd = servedEnd;
     var rangeTotal = _total;
-    var bodyEnd = _total;
+    var bodyEnd = servedEnd + 1;
     var chunked = false;
     var drop = false;
     var encoding = 'identity';
@@ -170,7 +192,29 @@ class _Fixture {
         case 'refuse':
           status = HttpStatus.notAcceptable;
         case 'valid':
+        case 'pieceOpenEnded':
           break;
+        case 'pieceCut406':
+          // The third piece is cut once; its continuation is refused once
+          // with an expired-token 406, as the provider does.
+          if (start == 2 * _piece && failedOnce.add(start)) {
+            bodyEnd = start + 300 * 1024 + 11;
+            drop = true;
+          } else if (start == 2 * _piece + 300 * 1024 + 11 &&
+              failedOnce.add(start)) {
+            status = HttpStatus.notAcceptable;
+          }
+        case 'pieceShort':
+          // A valid chunked piece that ends early once.
+          chunked = true;
+          if (start == 3 * _piece && failedOnce.add(start)) {
+            bodyEnd = start + 123457;
+          }
+        case 'pieceSurplus':
+          chunked = true;
+          if (start == 2 * _piece) bodyEnd = servedEnd + 1 + 8192;
+        case 'piece404':
+          if (start == 4 * _piece) status = HttpStatus.notFound;
         default:
           throw StateError('Unknown fixture mode $mode');
       }
@@ -215,7 +259,7 @@ class _Fixture {
             ? -1
             : probe
             ? 1
-            : _total - start + (mode == 'badLength' ? 1 : 0);
+            : servedEnd + 1 - start + (mode == 'badLength' ? 1 : 0);
     final responseHeaders = <String, List<String>>{};
     response.headers.forEach((name, values) => responseHeaders[name] = values);
     final event = <String, Object?>{
@@ -230,6 +274,15 @@ class _Fixture {
     _log('httpResponse', event);
 
     Socket? socket;
+    var bodyOpen = !probe;
+    if (bodyOpen) openBodies++;
+    void bodyQueued() {
+      if (bodyOpen) {
+        bodyOpen = false;
+        openBodies--;
+      }
+    }
+
     try {
       // The deliberate disconnect sends fewer bytes than Content-Length;
       // normal short/surplus EOF cases use valid chunked HTTP framing instead.
@@ -246,9 +299,11 @@ class _Fixture {
                 ]);
         if (socket == null) {
           response.add(bytes);
+          if (end == bodyEnd) bodyQueued();
           await response.flush();
         } else {
           socket.add(bytes);
+          if (end == bodyEnd) bodyQueued();
           await socket.flush();
         }
         if (!probe) {
@@ -274,6 +329,7 @@ class _Fixture {
         'error': '$error',
         'stack': '$stack',
       });
+      bodyQueued();
       socket?.destroy();
       try {
         await response.close();
@@ -408,6 +464,7 @@ Future<_ObservedTask> _create(
   String mode = 'valid',
   bool marked = true,
   int retries = 0,
+  int? pieceBytes,
   String? eTag,
   List<int>? existingDestination,
 }) async {
@@ -431,7 +488,11 @@ Future<_ObservedTask> _create(
             : {'Accept-Encoding': 'gzip, deflate'},
     metaData:
         marked
-            ? jsonEncode({'rangeResume': true, 'rangeTotal': '$_total'})
+            ? jsonEncode({
+              'rangeResume': true,
+              'rangeTotal': '$_total',
+              if (pieceBytes != null) 'rangePieceBytes': pieceBytes,
+            })
             : jsonEncode({'ordinaryTask': true}),
   );
   final observed = _ObservedTask(fixture, task);
@@ -861,6 +922,224 @@ void main() {
     expect(await _downloader.cancelTaskWithId(observed.task.taskId), isTrue);
     await observed.expectClean(unpublished: true);
     expect(await File(resume.tempFilepath).exists(), isFalse);
+  }, timeout: _timeout);
+
+  testWidgets(
+    'pieces request bounded ranges one after another, each from the origin',
+    (tester) async {
+      final observed = await _create('pieces', pieceBytes: _piece);
+      await observed.expectPublished();
+      final origins = observed.fixture.origins;
+      expect(origins.map((request) => request['start']).toList(), [
+        for (var start = 0; start < _total; start += _piece) start,
+      ]);
+      expect(origins.map((request) => request['end']).toList(), [
+        for (var start = 0; start < _total; start += _piece) start + _piece - 1,
+      ]);
+      // A fresh redirect per piece, and never two bodies at once.
+      expect(origins.map((request) => request['token']).toList(), [
+        for (var token = 1; token <= _total ~/ _piece; token++) token,
+      ]);
+      expect(origins.every((request) => request['openBodies'] == 0), isTrue);
+      expect(
+        observed.fixture.responses.every(
+          (response) => response['status'] == HttpStatus.partialContent,
+        ),
+        isTrue,
+      );
+      expect(
+        observed.statuses.any(
+          (update) => update.status == TaskStatus.waitingToRetry,
+        ),
+        isFalse,
+      );
+      var lastProgress = 0.0;
+      for (final update in observed.progress.where(
+        (update) => update.progress >= 0,
+      )) {
+        expect(update.progress, greaterThanOrEqualTo(lastProgress));
+        lastProgress = update.progress;
+      }
+      _log('piecesVerified', {
+        'taskId': observed.task.taskId,
+        'pieces': origins.length,
+      });
+    },
+    timeout: _timeout,
+  );
+
+  testWidgets(
+    'a cut piece then 406 resumes from the exact byte with bounded pieces',
+    (tester) async {
+      final observed = await _create(
+        'piece-cut-406',
+        mode: 'pieceCut406',
+        retries: 2,
+        pieceBytes: _piece,
+      );
+      await observed.expectPublished();
+      const cut = 2 * _piece + 300 * 1024 + 11;
+      expect(
+        observed.fixture.origins.map((request) => request['start']).toList(),
+        [
+          0,
+          _piece,
+          2 * _piece,
+          cut,
+          for (var start = cut; start < _total; start += _piece) start,
+        ],
+      );
+      expect(
+        observed.fixture.origins.map((request) => request['end']).toList(),
+        [
+          _piece - 1,
+          2 * _piece - 1,
+          3 * _piece - 1,
+          cut + _piece - 1,
+          for (var start = cut; start < _total; start += _piece)
+            (start + _piece).clamp(0, _total) - 1,
+        ],
+      );
+      expect(
+        observed.fixture.origins.every((request) => request['openBodies'] == 0),
+        isTrue,
+      );
+      expect(
+        observed.statuses
+            .where((update) => update.status == TaskStatus.waitingToRetry)
+            .length,
+        2,
+      );
+    },
+    timeout: _timeout,
+  );
+
+  testWidgets(
+    'a short chunked piece keeps its bytes and resumes after them',
+    (tester) async {
+      final observed = await _create(
+        'piece-short',
+        mode: 'pieceShort',
+        retries: 1,
+        pieceBytes: _piece,
+      );
+      await observed.expectPublished();
+      const short = 3 * _piece + 123457;
+      expect(
+        observed.fixture.origins.map((request) => request['start']).toList(),
+        [
+          0,
+          _piece,
+          2 * _piece,
+          3 * _piece,
+          for (var start = short; start < _total; start += _piece) start,
+        ],
+      );
+    },
+    timeout: _timeout,
+  );
+
+  testWidgets(
+    'a piece answered with the rest of the file is rejected, then dropped on the last retry',
+    (tester) async {
+      final observed = await _create(
+        'piece-open-ended',
+        mode: 'pieceOpenEnded',
+        retries: 1,
+        pieceBytes: _piece,
+      );
+      final finalUpdate = await observed.waitFinal();
+      expect(finalUpdate.status, TaskStatus.failed);
+      expect(
+        observed.fixture.origins.map((request) => request['start']).toList(),
+        [0, _piece, _piece],
+      );
+      await observed.expectClean(unpublished: true);
+    },
+    timeout: _timeout,
+  );
+
+  testWidgets('a surplus piece body is rejected and its partial removed', (
+    tester,
+  ) async {
+    final observed = await _create(
+      'piece-surplus',
+      mode: 'pieceSurplus',
+      pieceBytes: _piece,
+    );
+    expect((await observed.waitFinal()).status, TaskStatus.failed);
+    expect(
+      observed.fixture.origins.map((request) => request['start']).toList(),
+      [0, _piece, 2 * _piece],
+    );
+    await observed.expectClean(unpublished: true);
+  }, timeout: _timeout);
+
+  testWidgets('a 404 piece keeps the earlier pieces until canceled', (
+    tester,
+  ) async {
+    final observed = await _create(
+      'piece-404',
+      mode: 'piece404',
+      pieceBytes: _piece,
+    );
+    expect((await observed.waitFinal()).status, TaskStatus.notFound);
+    final kept = await _downloader.downloaderForTesting.getResumeData(
+      observed.task.taskId,
+    );
+    expect(kept?.requiredStartByte, 4 * _piece);
+    final prefix = await File(kept!.tempFilepath).readAsBytes();
+    expect(
+      listEquals(prefix, Uint8List.sublistView(_payload, 0, 4 * _piece)),
+      isTrue,
+    );
+    expect(await _downloader.taskCanResume(observed.task), isTrue);
+    expect(await _downloader.cancelTaskWithId(observed.task.taskId), isTrue);
+    await observed.expectClean(unpublished: true);
+    expect(await File(kept.tempFilepath).exists(), isFalse);
+  }, timeout: _timeout);
+
+  testWidgets('pause during pieces resumes with a bounded piece', (
+    tester,
+  ) async {
+    final observed = await _create('piece-pause', pieceBytes: _piece);
+    final resume = await observed.pause();
+    final paused = observed.fixture.origins.length;
+    expect(await _downloader.resume(observed.task), isTrue);
+    await observed.expectPublished();
+    final resumed = observed.fixture.origins[paused];
+    expect(resumed['start'], resume.requiredStartByte);
+    expect(resumed['end'], resume.requiredStartByte + _piece - 1);
+    expect(
+      observed.fixture.origins
+          .take(paused)
+          .every((request) => request['openBodies'] == 0),
+      isTrue,
+    );
+    // This server never sees the paused piece's body end: a flush to the
+    // connection the client closed never completes. The resumed pieces still
+    // never overlap: none finds more open bodies than the first.
+    final after = observed.fixture.origins.skip(paused);
+    expect(
+      after.every((request) => request['openBodies'] == resumed['openBodies']),
+      isTrue,
+    );
+  }, timeout: _timeout);
+
+  testWidgets('cancellation during pieces removes the native partial', (
+    tester,
+  ) async {
+    final observed = await _create('piece-cancel', pieceBytes: _piece);
+    await _until(
+      () => observed.progress.any((update) => update.progress > 0.3),
+      'No progress before cancellation',
+    );
+    expect(await _downloader.cancel(observed.task), isTrue);
+    expect((await observed.waitFinal()).status, TaskStatus.canceled);
+    await observed.expectClean(unpublished: true);
+    final requests = observed.fixture.origins.length;
+    await Future<void>.delayed(const Duration(seconds: 2));
+    expect(observed.fixture.origins.length, requests);
   }, timeout: _timeout);
 
   testWidgets(
